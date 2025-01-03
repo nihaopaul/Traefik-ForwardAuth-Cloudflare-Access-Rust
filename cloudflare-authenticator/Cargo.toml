@@ -12,3 +12,4 @@ tokio = { version = "1", features = ["full"] }
 urlencoding = "2.1.0"
 serde_urlencoded = "0.7.1"
 mockito = "1.6.1"
+jsonwebtoken = "9.3.0"

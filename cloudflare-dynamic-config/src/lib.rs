@@ -12,7 +12,6 @@ pub struct App {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub api: String,
-    pub account_id: String,
     pub token: String,
     pub duration: u64,
 }
@@ -56,6 +55,7 @@ impl DynamicConfigManager {
     }
 
     fn update_apps(&self, new_apps: Vec<App>) {
+        println!("Updating apps: {:?}", new_apps);
         let mut apps = self.apps.lock().unwrap();
         *apps = new_apps;
     }
@@ -142,7 +142,6 @@ mod tests {
 
         let config = Config {
             api: mock_url.clone(),
-            account_id: "test-account".into(),
             token: "test-token".into(),
             duration: 60 * 60,
         };

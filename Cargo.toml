@@ -4,7 +4,15 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-
+axum = "0.7.9"
+reqwest = { version = "0.12.12", features = ["json"] }
+serde = { version = "1.0.217", features = ["derive"] }
+thiserror = "2.0.9"
+tokio = { version = "1.42.0", features = ["full"] }
+tower-cookies = "0.10.0"
 
 [dependencies.cloudflare-dynamic-config]
 path = "cloudflare-dynamic-config"
+
+[dependencies.cloudflare-authenticator]
+path = "cloudflare-authenticator"
