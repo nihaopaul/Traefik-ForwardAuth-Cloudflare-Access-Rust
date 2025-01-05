@@ -2,7 +2,7 @@
 name = "traefik-forward-auth-rust"
 version = "0.1.0"
 edition = "2021"
-authors = ["Paul Adams <nihaopaul@gmail.com"]
+authors = ["Paul Adams <nihaopaul@gmail.com>"]
 
 [dependencies]
 axum = "0.7.9"
