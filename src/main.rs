@@ -48,7 +48,7 @@ async fn main() {
     };
 
     let app = Router::new()
-        .route("/", get(handler))
+        .route("/auth", get(handler))
         .layer(CookieManagerLayer::new())
         .with_state(app_state);
 
