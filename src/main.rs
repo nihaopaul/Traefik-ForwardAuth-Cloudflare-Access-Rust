@@ -1,5 +1,6 @@
 use cloudflare_authenticator as cfa;
 use cloudflare_dynamic_config as cdc;
+use local_ip_address::local_ip;
 use std::env;
 
 use axum::{
@@ -37,6 +38,10 @@ async fn handler(
 
 #[tokio::main]
 async fn main() {
+    let local_ip = local_ip().unwrap_or("unknown".to_string());
+
+    println!("Starting on IP: {:?}", local_ip);
+
     let port = env::var("PORT").unwrap_or("3000".to_string());
     let app_state = AppState {
         authenticator: start_authenticator_service().await,

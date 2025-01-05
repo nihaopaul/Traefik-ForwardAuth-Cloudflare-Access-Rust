@@ -31,8 +31,11 @@ http:
     test-auth:
       forwardAuth:
         address: "http://IP:PORT/auth"
+```
+
 then under the domain specify the provider, you probably dont want to do this on a writable dashboard or API.
 
+```yml
 http:
   routers:
     dashboard:
@@ -42,5 +45,4 @@ http:
         - test-auth
       entryPoints:
         - "websecure"
-
 ```
