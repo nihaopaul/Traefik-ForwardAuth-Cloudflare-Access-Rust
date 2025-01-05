@@ -37,6 +37,7 @@ async fn handler(
 
 #[tokio::main]
 async fn main() {
+    let port = env::var("PORT").unwrap_or("3000".to_string());
     let app_state = AppState {
         authenticator: start_authenticator_service().await,
         configurator: start_dynamic_config_manager().await,
@@ -47,7 +48,9 @@ async fn main() {
         .layer(CookieManagerLayer::new())
         .with_state(app_state);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port))
+        .await
+        .unwrap();
     axum::serve(listener, app).await.unwrap();
 }
 
