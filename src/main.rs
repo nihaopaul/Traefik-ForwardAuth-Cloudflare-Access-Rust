@@ -38,8 +38,7 @@ async fn handler(
 
 #[tokio::main]
 async fn main() {
-    let local_ip = local_ip().unwrap_or("unknown".to_string());
-
+    let local_ip = local_ip().unwrap();
     println!("Starting on IP: {:?}", local_ip);
 
     let port = env::var("PORT").unwrap_or("3000".to_string());
