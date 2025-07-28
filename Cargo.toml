@@ -7,7 +7,7 @@ authors = ["Paul Adams <nihaopaul@gmail.com>"]
 [dependencies]
 axum = "0.8.4"
 local-ip-address = "0.6.3"
-reqwest = { version = "0.12.12", features = ["json"] }
+reqwest = { version = "0.12.15", features = ["json"] }
 serde = { version = "1.0.219", features = ["derive"] }
 thiserror = "2.0.9"
 tokio = { version = "1.43.1", features = ["full"] }
