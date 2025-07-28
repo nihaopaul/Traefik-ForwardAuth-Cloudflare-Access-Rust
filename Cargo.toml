@@ -11,7 +11,7 @@ reqwest = { version = "0.12.15", features = ["json"] }
 serde = { version = "1.0.219", features = ["derive"] }
 thiserror = "2.0.9"
 tokio = { version = "1.43.1", features = ["full"] }
-tower-cookies = "0.10.0"
+tower-cookies = "0.11.0"
 
 [dependencies.cloudflare-dynamic-config]
 path = "cloudflare-dynamic-config"
