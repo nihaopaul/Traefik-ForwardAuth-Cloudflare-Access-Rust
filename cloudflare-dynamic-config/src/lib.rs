@@ -20,6 +20,7 @@ pub struct Config {
 pub struct DynamicConfigManager {
     config: Config,
     apps: Arc<Mutex<Vec<App>>>, // Use Arc and Mutex for shared access
+    client: reqwest::Client,
 }
 
 #[derive(Error, Debug)]
@@ -41,6 +42,7 @@ impl DynamicConfigManager {
         let manager = Self {
             config,
             apps: Arc::new(Mutex::new(Vec::new())),
+            client: reqwest::Client::new(),
         };
 
         // Start the background task to update apps periodically
@@ -63,8 +65,8 @@ impl DynamicConfigManager {
     async fn fetch_apps(&self) -> Result<(), ConfigError> {
         let query_params = [("match", "any"), ("ui_apps", "true")];
 
-        let client = reqwest::Client::new();
-        let response = client
+        let response = self
+            .client
             .get(&format!(
                 "{}?{}",
                 self.config.api.clone(),
