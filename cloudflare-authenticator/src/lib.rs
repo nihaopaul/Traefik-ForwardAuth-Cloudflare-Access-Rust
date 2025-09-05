@@ -40,6 +40,7 @@ pub struct Config {
 pub struct Authenticator {
     config: Config,
     certs: Arc<Mutex<Certs>>,
+    client: reqwest::Client,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -97,6 +98,7 @@ impl Authenticator {
                 },
                 public_certs: vec![],
             })),
+            client: reqwest::Client::new(),
         };
 
         // Start the background task to update certs periodically
@@ -146,8 +148,8 @@ impl Authenticator {
     }
 
     async fn fetch_certs(&self) -> Result<(), ValidationError> {
-        let client = reqwest::Client::new();
-        let response = client
+        let response = self
+            .client
             .get(&format!("{}/cdn-cgi/access/certs", &self.config.api))
             .header(header::CONTENT_TYPE, "application/json")
             .send()
