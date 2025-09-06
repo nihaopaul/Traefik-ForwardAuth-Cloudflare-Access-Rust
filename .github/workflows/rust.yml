@@ -10,6 +10,8 @@ env:
 jobs:
   docker:
     name: push docker image to hub
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     steps:
       - name: check repository
