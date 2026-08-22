@@ -1,2 +1,9 @@
 .git
 target
+
+# Local devbox toolchain (~1.3GB). It self-ignores via .devbox/.gitignore, which
+# .dockerignore does not honour, so it has to be excluded explicitly.
+.devbox
+.envrc
+devbox.json
+devbox.lock
