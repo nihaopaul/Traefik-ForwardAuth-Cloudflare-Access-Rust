@@ -3,13 +3,32 @@ name: Rust Build CI
 on:
   release:
     types: [published]
+  pull_request:
+    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  build:
+    name: build and test
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - name: check repository
+        uses: actions/checkout@v4
+
+      - name: build
+        run: cargo build --release
+
+      - name: test
+        run: cargo test
+
   docker:
     name: push docker image to hub
+    if: github.event_name == 'release'
+    needs: build
     permissions:
       contents: read
     runs-on: ubuntu-latest
@@ -37,4 +56,3 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           annotations: ${{ steps.meta.outputs.annotations }}
-          # tags: nihaopaul/forward-auth:latest
