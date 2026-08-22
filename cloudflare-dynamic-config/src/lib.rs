@@ -67,13 +67,13 @@ impl DynamicConfigManager {
 
         let response = self
             .client
-            .get(&format!(
+            .get(format!(
                 "{}?{}",
-                self.config.api.clone(),
-                serde_urlencoded::to_string(&query_params)?
+                self.config.api,
+                serde_urlencoded::to_string(query_params)?
             ))
             .header(header::CONTENT_TYPE, "application/json")
-            .bearer_auth(&self.config.token.clone())
+            .bearer_auth(self.config.token.as_str())
             .send()
             .await?;
 
@@ -110,7 +110,6 @@ impl DynamicConfigManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mockito;
     use serde_json::json;
 
     #[tokio::test] // Use tokio for async testing

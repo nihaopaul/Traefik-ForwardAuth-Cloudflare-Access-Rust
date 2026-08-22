@@ -73,12 +73,10 @@ async fn start_dynamic_config_manager() -> cdc::DynamicConfigManager {
     };
 
     // Create and initialize the manager using new()
-    let manager = match cdc::DynamicConfigManager::new(config).await {
+    match cdc::DynamicConfigManager::new(config).await {
         Ok(manager) => manager,
         Err(e) => panic!("Failed to create DynamicConfigManager: {}", e),
-    };
-
-    return manager;
+    }
 }
 
 async fn start_authenticator_service() -> cfa::Authenticator {
@@ -89,9 +87,8 @@ async fn start_authenticator_service() -> cfa::Authenticator {
     };
 
     // Create and initialize the manager using new()
-    let manager = match cfa::Authenticator::new(config).await {
+    match cfa::Authenticator::new(config).await {
         Ok(manager) => manager,
-        Err(e) => panic!("Failed to create DynamicConfigManager: {}", e),
-    };
-    return manager;
+        Err(e) => panic!("Failed to create Authenticator: {}", e),
+    }
 }

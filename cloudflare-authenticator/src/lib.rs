@@ -118,7 +118,7 @@ impl Authenticator {
         jwt: &str,
         auds: Vec<String>,
     ) -> Result<TokenData<Claims>, ValidationError> {
-        let header = decode_header(&jwt)?;
+        let header = decode_header(jwt)?;
 
         let kid = header.kid.as_ref().ok_or(ValidationError::InvalidToken)?;
         let key = self.get_certificate(kid).await?;
@@ -147,14 +147,14 @@ impl Authenticator {
     }
 
     pub async fn test(&self, jwt: &str, auds: Vec<String>) -> Result<(), ValidationError> {
-        self.decode(&jwt, auds).await?;
+        self.decode(jwt, auds).await?;
         Ok(())
     }
 
     async fn fetch_certs(&self) -> Result<(), ValidationError> {
         let response = self
             .client
-            .get(&format!("{}/cdn-cgi/access/certs", &self.config.api))
+            .get(format!("{}/cdn-cgi/access/certs", self.config.api))
             .header(header::CONTENT_TYPE, "application/json")
             .send()
             .await?;
