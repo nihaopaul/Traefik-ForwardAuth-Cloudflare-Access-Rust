@@ -173,9 +173,12 @@ dependencies = [
 name = "cloudflare-authenticator"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "jsonwebtoken",
  "mockito",
+ "rand 0.8.7",
  "reqwest",
+ "rsa",
  "serde",
  "serde_json",
  "serde_urlencoded",

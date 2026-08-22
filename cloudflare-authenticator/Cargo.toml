@@ -22,3 +22,9 @@ jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 
 [dev-dependencies]
 mockito = "1.6.1"
+# Used to mint a throwaway RSA keypair per test run, so signed-token tests need
+# no committed private key and no hardcoded expiry. Already in the dependency
+# tree via jsonwebtoken's rust_crypto backend.
+base64 = "0.22"
+rand = "0.8"
+rsa = { version = "0.9", features = ["pem"] }
