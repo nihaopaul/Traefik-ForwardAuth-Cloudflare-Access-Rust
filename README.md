@@ -36,8 +36,8 @@ services:
       CF_ORG: your-cloudflare-account-id
       CF_TOKEN: your-read-only-api-token
       PORT: '9001'
-    ports:
-      - '9001:9001'
+    expose:
+      - '9001'
     deploy:
       resources:
         limits:
@@ -69,20 +69,81 @@ http:
         - cf-auth
 ```
 
+## Bind routes to Cloudflare applications
+
+Set `X-Auth-Audience` in Traefik immediately before ForwardAuth to validate a route against one Cloudflare Access application. In the default `any_app` mode, routes without this header continue using the discovered application catalog, so routes can be migrated one at a time. `per_app` mode requires every request to have exactly one valid binding and never loads the catalog.
+
+The header is a trusted internal control, not client input. Strip any client-supplied value with an entrypoint middleware that runs before router middlewares:
+
+```yaml
+# Static Traefik configuration
+entryPoints:
+  websecure:
+    address: ":443"
+    http:
+      middlewares:
+        - strip-auth-audience@file
+```
+
+Then define the global stripping middleware, a per-application setter, and the shared ForwardAuth middleware in dynamic configuration:
+
+```yaml
+http:
+  middlewares:
+    strip-auth-audience:
+      headers:
+        customRequestHeaders:
+          X-Auth-Audience: "" # remove untrusted client input
+
+    dashboard-audience:
+      headers:
+        customRequestHeaders:
+          X-Auth-Audience: "<dashboard-application-aud>"
+
+    cf-auth:
+      forwardAuth:
+        address: "http://forward-auth-rust:9001/auth"
+
+  routers:
+    dashboard:
+      rule: Host(`traefik.example.com`)
+      service: api@internal
+      entryPoints:
+        - websecure
+      middlewares:
+        - dashboard-audience@file # set the trusted route binding first
+        - cf-auth@file            # ForwardAuth receives that binding
+```
+
+[Traefik prepends entrypoint middlewares](https://doc.traefik.io/traefik/reference/install-configuration/entrypoints/#httpmiddlewares) to each router's middleware list, and its [Headers middleware](https://doc.traefik.io/traefik/reference/routing-configuration/http/middlewares/headers/#configuration-options) removes a request header when configured with an empty value. Per-application setters overwrite the stripped value before ForwardAuth. If `authRequestHeaders` is configured on ForwardAuth, include `X-Auth-Audience`, `Cf-Access-Jwt-Assertion`, and `Cookie`; leaving it unset forwards all request headers.
+
+Keep the auth service reachable only from Traefik's private network. A caller that can reach it directly can supply the trusted header. Never derive the audience from `X-Forwarded-Uri`, the original query string, host, or another client-controlled value.
+
+The header must occur exactly once, contain 1–256 non-whitespace characters, and contain no comma. Its value is checked directly against the signed JWT without requiring catalog membership, so catalog refreshes cannot break a bound route and a typo fails closed.
+
+For a fully bound deployment, remove the Applications API credentials and enable strict mode:
+
+```yaml
+environment:
+  CF_AUTHORIZATION_MODE: per_app
+  CF_DOMAIN: https://yourteam.cloudflareaccess.com
+```
+
 ## Configuration
 
 | Variable | Required | Description |
 | --- | --- | --- |
 | `CF_DOMAIN` | yes | Your Zero Trust team domain, including `https://` — the hostname where Cloudflare shows your login page. |
-| `CF_ORG` | yes | Your Cloudflare **account ID** — the value in your dashboard URL, `https://dash.cloudflare.com/{account-id}`. |
-| `CF_TOKEN` | yes | API token with **Account → Access: Apps and Policies → Read**. Read-only is enough. |
+| `CF_AUTHORIZATION_MODE` | no | `any_app` (default) permits catalog-backed unbound routes; `per_app` requires every route to supply a trusted audience binding. Other values fail startup. |
+| `CF_ORG` | `any_app` only | Your Cloudflare **account ID** — the value in your dashboard URL, `https://dash.cloudflare.com/{account-id}`. Never read in `per_app`. |
+| `CF_TOKEN` | `any_app` only | API token with **Account → Access: Apps and Policies → Read**. Never read or used in `per_app`. |
 | `PORT` | no | Port to listen on. Defaults to `3000`. |
 
 The service listens on `0.0.0.0` and exposes a single endpoint, `GET /auth`.
 
 ## Notes
 
-**Protect the right things.** This gates on "is this a valid login for one of my Cloudflare apps" — it does not evaluate per-application policies. Two apps behind the same instance can accept each other's tokens, so think carefully before putting it in front of a writable dashboard or API.
+**Bind sensitive routes.** By default, unbound routes accept a valid application token for any discovered Cloudflare Access app. Bind a route by having Traefik set its trusted `X-Auth-Audience`, or use `CF_AUTHORIZATION_MODE=per_app` to require every route to be bound. A fully bound deployment needs no Cloudflare API token. Cloudflare evaluates each application's policies; this service validates the resulting app-specific token.
 
 **Expiry allows normal clock skew.** JWT expiration uses jsonwebtoken's 60-second leeway, so `expired_token` is logged only after a token is more than 60 seconds past its `exp` value.
 

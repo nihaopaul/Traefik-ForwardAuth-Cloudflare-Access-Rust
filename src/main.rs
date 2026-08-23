@@ -18,12 +18,17 @@ use tower_cookies::{CookieManagerLayer, Cookies};
 #[derive(Clone)]
 struct AppState<A = cfa::Authenticator, C = cdc::DynamicConfigManager> {
     authenticator: A,
-    configurator: C,
+    configurator: Option<C>,
+    authorization_mode: AuthorizationMode,
     denial_logger: DenialLogger,
 }
 
 trait TokenAuthenticator: Clone + Send + Sync + 'static {
-    async fn validate(&self, token: &str, auds: Vec<String>) -> Result<(), &'static str>;
+    fn validate(
+        &self,
+        token: &str,
+        auds: Vec<String>,
+    ) -> impl std::future::Future<Output = Result<(), &'static str>> + Send;
 }
 
 impl TokenAuthenticator for cfa::Authenticator {
@@ -35,7 +40,7 @@ impl TokenAuthenticator for cfa::Authenticator {
 }
 
 trait AudienceCatalog: Clone + Send + Sync + 'static {
-    async fn audiences(&self) -> Vec<String>;
+    fn audiences(&self) -> impl std::future::Future<Output = Vec<String>> + Send;
 }
 
 impl AudienceCatalog for cdc::DynamicConfigManager {
@@ -47,8 +52,123 @@ impl AudienceCatalog for cdc::DynamicConfigManager {
 const MISSING_TOKEN: &str = "missing_token";
 const MALFORMED_TOKEN: &str = "malformed_token";
 const CATALOG_EMPTY: &str = "catalog_empty";
+const MISSING_AUDIENCE_OVERRIDE: &str = "missing_audience_override";
+const INVALID_AUDIENCE_OVERRIDE: &str = "invalid_audience_override";
+const AUTH_AUDIENCE_HEADER: &str = "X-Auth-Audience";
+const MAX_AUDIENCE_OVERRIDE_LENGTH: usize = 256;
 const DENIAL_LOG_LIMIT: u32 = 10;
 const DENIAL_LOG_WINDOW: Duration = Duration::from_secs(60);
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum AuthorizationMode {
+    #[default]
+    AnyApp,
+    PerApp,
+}
+
+impl AuthorizationMode {
+    fn parse(value: Option<&str>) -> Result<Self, StartupConfigError> {
+        match value {
+            None | Some("any_app") => Ok(Self::AnyApp),
+            Some("per_app") => Ok(Self::PerApp),
+            Some(_) => Err(StartupConfigError::InvalidAuthorizationMode),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AnyApp => "any_app",
+            Self::PerApp => "per_app",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CatalogCredentials {
+    account_id: String,
+    token: String,
+}
+
+#[derive(Debug)]
+struct StartupConfig {
+    port: String,
+    domain: String,
+    authorization_mode: AuthorizationMode,
+    catalog_credentials: Option<CatalogCredentials>,
+}
+
+#[derive(Debug, thiserror::Error, Eq, PartialEq)]
+enum StartupConfigError {
+    #[error("{0} must be set")]
+    MissingVariable(&'static str),
+    #[error("{0} must contain valid Unicode")]
+    NonUnicodeVariable(&'static str),
+    #[error("CF_AUTHORIZATION_MODE must be any_app or per_app")]
+    InvalidAuthorizationMode,
+}
+
+impl StartupConfig {
+    fn from_env() -> Result<Self, StartupConfigError> {
+        Self::from_reader(|name| env::var(name))
+    }
+
+    fn from_reader<F>(mut read: F) -> Result<Self, StartupConfigError>
+    where
+        F: FnMut(&str) -> Result<String, env::VarError>,
+    {
+        fn required<F>(read: &mut F, name: &'static str) -> Result<String, StartupConfigError>
+        where
+            F: FnMut(&str) -> Result<String, env::VarError>,
+        {
+            match read(name) {
+                Ok(value) => Ok(value),
+                Err(env::VarError::NotPresent) => Err(StartupConfigError::MissingVariable(name)),
+                Err(env::VarError::NotUnicode(_)) => {
+                    Err(StartupConfigError::NonUnicodeVariable(name))
+                }
+            }
+        }
+
+        let mode_value = match read("CF_AUTHORIZATION_MODE") {
+            Ok(value) => Some(value),
+            Err(env::VarError::NotPresent) => None,
+            Err(env::VarError::NotUnicode(_)) => {
+                return Err(StartupConfigError::NonUnicodeVariable(
+                    "CF_AUTHORIZATION_MODE",
+                ));
+            }
+        };
+        let authorization_mode = AuthorizationMode::parse(mode_value.as_deref())?;
+        let domain = required(&mut read, "CF_DOMAIN")?;
+        let port = match read("PORT") {
+            Ok(value) => value,
+            Err(env::VarError::NotPresent) => "3000".to_string(),
+            Err(env::VarError::NotUnicode(_)) => {
+                return Err(StartupConfigError::NonUnicodeVariable("PORT"));
+            }
+        };
+        let catalog_credentials = match authorization_mode {
+            AuthorizationMode::AnyApp => Some(CatalogCredentials {
+                account_id: required(&mut read, "CF_ORG")?,
+                token: required(&mut read, "CF_TOKEN")?,
+            }),
+            AuthorizationMode::PerApp => None,
+        };
+
+        Ok(Self {
+            port,
+            domain,
+            authorization_mode,
+            catalog_credentials,
+        })
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum AudienceSelection {
+    Catalog,
+    Bound(String),
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TokenSource {
@@ -200,6 +320,34 @@ fn select_token(
     }
 }
 
+fn select_audience(
+    headers: &HeaderMap,
+    mode: AuthorizationMode,
+) -> Result<AudienceSelection, &'static str> {
+    let mut values = headers.get_all(AUTH_AUDIENCE_HEADER).iter();
+    let Some(value) = values.next() else {
+        return match mode {
+            AuthorizationMode::AnyApp => Ok(AudienceSelection::Catalog),
+            AuthorizationMode::PerApp => Err(MISSING_AUDIENCE_OVERRIDE),
+        };
+    };
+
+    if values.next().is_some() {
+        return Err(INVALID_AUDIENCE_OVERRIDE);
+    }
+
+    let value = value.to_str().map_err(|_| INVALID_AUDIENCE_OVERRIDE)?;
+    if value.is_empty()
+        || value.len() > MAX_AUDIENCE_OVERRIDE_LENGTH
+        || value.contains(',')
+        || value.chars().any(char::is_whitespace)
+    {
+        return Err(INVALID_AUDIENCE_OVERRIDE);
+    }
+
+    Ok(AudienceSelection::Bound(value.to_string()))
+}
+
 async fn handler<A, C>(
     State(state): State<AppState<A, C>>,
     cookies: Cookies,
@@ -220,13 +368,29 @@ where
         }
     };
 
-    let auds = state.configurator.audiences().await;
-    if auds.is_empty() {
-        state
-            .denial_logger
-            .record(CATALOG_EMPTY, Some(token_source));
-        return StatusCode::FORBIDDEN;
-    }
+    let auds = match select_audience(req.headers(), state.authorization_mode) {
+        Ok(AudienceSelection::Bound(audience)) => vec![audience],
+        Ok(AudienceSelection::Catalog) => {
+            let Some(configurator) = state.configurator.as_ref() else {
+                state
+                    .denial_logger
+                    .record(CATALOG_EMPTY, Some(token_source));
+                return StatusCode::FORBIDDEN;
+            };
+            let audiences = configurator.audiences().await;
+            if audiences.is_empty() {
+                state
+                    .denial_logger
+                    .record(CATALOG_EMPTY, Some(token_source));
+                return StatusCode::FORBIDDEN;
+            }
+            audiences
+        }
+        Err(reason) => {
+            state.denial_logger.record(reason, Some(token_source));
+            return StatusCode::FORBIDDEN;
+        }
+    };
 
     match state.authenticator.validate(&token, auds).await {
         Ok(_) => StatusCode::OK,
@@ -242,14 +406,30 @@ async fn main() {
     let local_ip = local_ip().unwrap();
     eprintln!("event=server_starting ip={local_ip}");
 
-    let port = env::var("PORT").unwrap_or("3000".to_string());
-    let authenticator = start_authenticator_service().await;
-    let configurator = start_dynamic_config_manager().await;
+    let startup = match StartupConfig::from_env() {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("event=configuration_invalid error={error}");
+            std::process::exit(1);
+        }
+    };
+    eprintln!(
+        "event=authorization_mode_configured mode={} catalog_enabled={}",
+        startup.authorization_mode.as_str(),
+        startup.catalog_credentials.is_some()
+    );
+
+    let authenticator = start_authenticator_service(startup.domain).await;
+    let configurator = match startup.catalog_credentials {
+        Some(credentials) => Some(start_dynamic_config_manager(credentials).await),
+        None => None,
+    };
     let denial_logger = DenialLogger::default();
     denial_logger.clone().start_flush_task();
     let app_state = AppState {
         authenticator,
         configurator,
+        authorization_mode: startup.authorization_mode,
         denial_logger,
     };
 
@@ -261,23 +441,22 @@ async fn main() {
         .layer(CookieManagerLayer::new())
         .with_state(app_state);
 
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port))
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", startup.port))
         .await
         .unwrap();
     axum::serve(listener, app).await.unwrap();
 }
 
-async fn start_dynamic_config_manager() -> cdc::DynamicConfigManager {
-    let account_id = env::var("CF_ORG").expect("CF_ORG must be set");
-    let token = env::var("CF_TOKEN").expect("CF_TOKEN must be set");
-
+async fn start_dynamic_config_manager(
+    credentials: CatalogCredentials,
+) -> cdc::DynamicConfigManager {
     let api = format!(
         "{}/client/v4/accounts/{}/access/apps",
-        "https://api.cloudflare.com", account_id
+        "https://api.cloudflare.com", credentials.account_id
     );
     let config = cdc::Config {
         api,
-        token,
+        token: credentials.token,
         duration: 60 * 60,
     };
 
@@ -290,8 +469,7 @@ async fn start_dynamic_config_manager() -> cdc::DynamicConfigManager {
     }
 }
 
-async fn start_authenticator_service() -> cfa::Authenticator {
-    let api = env::var("CF_DOMAIN").expect("CF_DOMAIN must be set");
+async fn start_authenticator_service(api: String) -> cfa::Authenticator {
     let config = cfa::Config {
         api,
         duration: 60 * 60 * 24,
@@ -336,14 +514,72 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct PanicCatalog;
+
+    impl AudienceCatalog for PanicCatalog {
+        async fn audiences(&self) -> Vec<String> {
+            panic!("an explicitly bound request must not read the catalog")
+        }
+    }
+
+    #[derive(Clone)]
+    struct AppBoundAuthenticator;
+
+    impl TokenAuthenticator for AppBoundAuthenticator {
+        async fn validate(&self, token: &str, auds: Vec<String>) -> Result<(), &'static str> {
+            let expected_audience = match token {
+                "token-a" => "app-a",
+                "token-b" => "app-b",
+                _ => return Err(MALFORMED_TOKEN),
+            };
+            if auds == [expected_audience] {
+                Ok(())
+            } else {
+                Err("audience_mismatch")
+            }
+        }
+    }
+
+    fn app_bound_router<C>(
+        mode: AuthorizationMode,
+        configurator: Option<C>,
+    ) -> (Router, DenialLogger)
+    where
+        C: AudienceCatalog,
+    {
+        let denial_logger = DenialLogger::default();
+        let state = AppState {
+            authenticator: AppBoundAuthenticator,
+            configurator,
+            authorization_mode: mode,
+            denial_logger: denial_logger.clone(),
+        };
+        let app = Router::new()
+            .route("/auth", get(handler::<AppBoundAuthenticator, C>))
+            .layer(CookieManagerLayer::new())
+            .with_state(state);
+
+        (app, denial_logger)
+    }
+
     fn test_app(
         audiences: Vec<String>,
         denial_reason: Option<&'static str>,
     ) -> (Router, DenialLogger) {
+        test_app_with_mode(audiences, denial_reason, AuthorizationMode::AnyApp)
+    }
+
+    fn test_app_with_mode(
+        audiences: Vec<String>,
+        denial_reason: Option<&'static str>,
+        authorization_mode: AuthorizationMode,
+    ) -> (Router, DenialLogger) {
         let denial_logger = DenialLogger::default();
         let state = AppState {
             authenticator: FakeAuthenticator { denial_reason },
-            configurator: FakeCatalog(audiences),
+            configurator: Some(FakeCatalog(audiences)),
+            authorization_mode,
             denial_logger: denial_logger.clone(),
         };
         let app = Router::new()
@@ -360,6 +596,89 @@ mod tests {
             .header("Cf-Access-Jwt-Assertion", "signed-token")
             .body(Body::empty())
             .expect("build request")
+    }
+
+    fn app_token_request(uri: &str, token: &str, audience: Option<&str>) -> HttpRequest<Body> {
+        let mut request = HttpRequest::builder()
+            .uri(uri)
+            .header("Cf-Access-Jwt-Assertion", token);
+        if let Some(audience) = audience {
+            request = request.header(AUTH_AUDIENCE_HEADER, audience);
+        }
+        request.body(Body::empty()).expect("build request")
+    }
+
+    fn environment<'a>(
+        values: &'a [(&'a str, &'a str)],
+    ) -> impl FnMut(&str) -> Result<String, env::VarError> + 'a {
+        move |name| {
+            values
+                .iter()
+                .find_map(|(key, value)| (*key == name).then(|| (*value).to_string()))
+                .ok_or(env::VarError::NotPresent)
+        }
+    }
+
+    #[test]
+    fn authorization_mode_defaults_to_any_app_and_rejects_unknown_values() {
+        assert_eq!(
+            AuthorizationMode::parse(None),
+            Ok(AuthorizationMode::AnyApp)
+        );
+        assert_eq!(
+            AuthorizationMode::parse(Some("any_app")),
+            Ok(AuthorizationMode::AnyApp)
+        );
+        assert_eq!(
+            AuthorizationMode::parse(Some("per_app")),
+            Ok(AuthorizationMode::PerApp)
+        );
+        assert_eq!(
+            AuthorizationMode::parse(Some("per-route")),
+            Err(StartupConfigError::InvalidAuthorizationMode)
+        );
+    }
+
+    #[test]
+    fn per_app_configuration_does_not_read_cloudflare_api_credentials() {
+        let mut reads = Vec::new();
+        let config = StartupConfig::from_reader(|name| {
+            reads.push(name.to_string());
+            match name {
+                "CF_AUTHORIZATION_MODE" => Ok("per_app".to_string()),
+                "CF_DOMAIN" => Ok("https://team.cloudflareaccess.com".to_string()),
+                "PORT" => Err(env::VarError::NotPresent),
+                "CF_ORG" | "CF_TOKEN" => panic!("strict mode must not read {name}"),
+                _ => Err(env::VarError::NotPresent),
+            }
+        })
+        .expect("strict mode requires no Applications API credentials");
+
+        assert_eq!(config.authorization_mode, AuthorizationMode::PerApp);
+        assert!(config.catalog_credentials.is_none());
+        assert!(!reads
+            .iter()
+            .any(|name| name == "CF_ORG" || name == "CF_TOKEN"));
+    }
+
+    #[test]
+    fn any_app_configuration_requires_cloudflare_api_credentials() {
+        let missing_org = StartupConfig::from_reader(environment(&[(
+            "CF_DOMAIN",
+            "https://team.cloudflareaccess.com",
+        )]))
+        .expect_err("unbound routes cannot start without an account ID");
+        assert_eq!(missing_org, StartupConfigError::MissingVariable("CF_ORG"));
+
+        let missing_token = StartupConfig::from_reader(environment(&[
+            ("CF_DOMAIN", "https://team.cloudflareaccess.com"),
+            ("CF_ORG", "account-id"),
+        ]))
+        .expect_err("unbound routes cannot start without an API token");
+        assert_eq!(
+            missing_token,
+            StartupConfigError::MissingVariable("CF_TOKEN")
+        );
     }
 
     #[test]
@@ -421,6 +740,61 @@ mod tests {
         assert_eq!(
             select_token(&HeaderMap::new(), None),
             Err((MISSING_TOKEN, None))
+        );
+    }
+
+    #[test]
+    fn any_app_uses_the_catalog_only_when_the_audience_header_is_absent() {
+        assert_eq!(
+            select_audience(&HeaderMap::new(), AuthorizationMode::AnyApp),
+            Ok(AudienceSelection::Catalog)
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTH_AUDIENCE_HEADER, HeaderValue::from_static("app-a"));
+        assert_eq!(
+            select_audience(&headers, AuthorizationMode::AnyApp),
+            Ok(AudienceSelection::Bound("app-a".into()))
+        );
+    }
+
+    #[test]
+    fn per_app_requires_exactly_one_valid_audience_header() {
+        assert_eq!(
+            select_audience(&HeaderMap::new(), AuthorizationMode::PerApp),
+            Err(MISSING_AUDIENCE_OVERRIDE)
+        );
+
+        for invalid in ["", " app-a", "app-a ", "app a", "app-a,app-b"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                AUTH_AUDIENCE_HEADER,
+                HeaderValue::from_str(invalid).expect("test header is syntactically valid"),
+            );
+            assert_eq!(
+                select_audience(&headers, AuthorizationMode::PerApp),
+                Err(INVALID_AUDIENCE_OVERRIDE),
+                "{invalid:?} must fail closed"
+            );
+        }
+
+        let mut duplicate = HeaderMap::new();
+        duplicate.append(AUTH_AUDIENCE_HEADER, HeaderValue::from_static("app-a"));
+        duplicate.append(AUTH_AUDIENCE_HEADER, HeaderValue::from_static("app-b"));
+        assert_eq!(
+            select_audience(&duplicate, AuthorizationMode::PerApp),
+            Err(INVALID_AUDIENCE_OVERRIDE)
+        );
+
+        let mut oversized = HeaderMap::new();
+        oversized.insert(
+            AUTH_AUDIENCE_HEADER,
+            HeaderValue::from_str(&"a".repeat(MAX_AUDIENCE_OVERRIDE_LENGTH + 1))
+                .expect("ASCII test header is valid"),
+        );
+        assert_eq!(
+            select_audience(&oversized, AuthorizationMode::PerApp),
+            Err(INVALID_AUDIENCE_OVERRIDE)
         );
     }
 
@@ -513,6 +887,75 @@ mod tests {
         let windows = logger.windows.lock().unwrap();
         assert_eq!(
             windows.get("invalid_issuer").map(|window| window.emitted),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn per_app_accepts_a_token_only_through_its_bound_application() {
+        let (app, _) = app_bound_router(AuthorizationMode::PerApp, None::<FakeCatalog>);
+
+        let accepted = app
+            .clone()
+            .oneshot(app_token_request("/auth", "token-a", Some("app-a")))
+            .await
+            .expect("handler responds");
+        assert_eq!(accepted.status(), StatusCode::OK);
+
+        let rejected = app
+            .oneshot(app_token_request("/auth", "token-a", Some("app-b")))
+            .await
+            .expect("handler responds");
+        assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn client_query_parameters_cannot_change_the_trusted_header_binding() {
+        let (app, _) = app_bound_router(AuthorizationMode::PerApp, None::<FakeCatalog>);
+
+        let response = app
+            .oneshot(app_token_request(
+                "/auth?aud=app-a",
+                "token-b",
+                Some("app-b"),
+            ))
+            .await
+            .expect("handler responds");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn any_app_explicit_binding_does_not_read_the_catalog() {
+        let (app, _) = app_bound_router(AuthorizationMode::AnyApp, Some(PanicCatalog));
+
+        let response = app
+            .oneshot(app_token_request("/auth", "token-a", Some("app-a")))
+            .await
+            .expect("handler responds");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn per_app_missing_binding_fails_closed_with_a_generic_response() {
+        let (app, logger) = app_bound_router(AuthorizationMode::PerApp, None::<FakeCatalog>);
+
+        let response = app
+            .oneshot(app_token_request("/auth", "token-a", None))
+            .await
+            .expect("handler responds");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read response body")
+            .is_empty());
+        let windows = logger.windows.lock().unwrap();
+        assert_eq!(
+            windows
+                .get(MISSING_AUDIENCE_OVERRIDE)
+                .map(|window| window.emitted),
             Some(1)
         );
     }

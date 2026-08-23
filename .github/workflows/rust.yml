@@ -35,6 +35,14 @@ jobs:
       - name: test
         run: cargo test --workspace
 
+      # Release only: this starts real containers, so it is too heavy for every
+      # pull request. It gates the image build below via `needs: build`, so a
+      # broken audience-binding middleware contract fails the release before
+      # anything is published.
+      - name: test Traefik audience binding
+        if: github.event_name == 'release'
+        run: sh tests/traefik/run.sh
+
   # One job per architecture, each on a runner of that architecture, so the
   # Rust tree is never cross-compiled under emulation. These push by digest
   # only; tags are applied by the merge job below.

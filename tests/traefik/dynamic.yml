@@ -1,0 +1,58 @@
+http:
+  middlewares:
+    strip-auth-audience:
+      headers:
+        customRequestHeaders:
+          X-Auth-Audience: ""
+
+    dashboard-audience:
+      headers:
+        customRequestHeaders:
+          X-Auth-Audience: "dashboard-aud"
+
+    wrong-audience:
+      headers:
+        customRequestHeaders:
+          X-Auth-Audience: "other-app-aud"
+
+    test-auth:
+      forwardAuth:
+        address: http://probe:9001/auth
+        # Test-only: the probe checks only the trusted audience header. A real
+        # deployment must also forward Cf-Access-Jwt-Assertion and Cookie, or
+        # leave authRequestHeaders unset as shown in the README.
+        authRequestHeaders:
+          - X-Auth-Audience
+
+  routers:
+    bound:
+      rule: PathPrefix(`/bound`)
+      entryPoints:
+        - web
+      middlewares:
+        - dashboard-audience
+        - test-auth
+      service: probe
+
+    unbound:
+      rule: PathPrefix(`/unbound`)
+      entryPoints:
+        - web
+      middlewares:
+        - test-auth
+      service: probe
+
+    wrong:
+      rule: PathPrefix(`/wrong`)
+      entryPoints:
+        - web
+      middlewares:
+        - wrong-audience
+        - test-auth
+      service: probe
+
+  services:
+    probe:
+      loadBalancer:
+        servers:
+          - url: http://probe:9001

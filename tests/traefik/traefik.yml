@@ -1,0 +1,13 @@
+entryPoints:
+  web:
+    address: ":80"
+    http:
+      middlewares:
+        - strip-auth-audience@file
+
+providers:
+  file:
+    filename: /etc/traefik/dynamic.yml
+
+log:
+  level: WARN

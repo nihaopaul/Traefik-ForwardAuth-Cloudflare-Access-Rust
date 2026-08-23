@@ -1,0 +1,16 @@
+services:
+  traefik:
+    image: traefik:v3.5
+    ports:
+      - "127.0.0.1:${TRAEFIK_TEST_PORT:-18080}:80"
+    volumes:
+      - ./traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./dynamic.yml:/etc/traefik/dynamic.yml:ro
+    depends_on:
+      - probe
+
+  probe:
+    image: python:3.13-alpine
+    command: ["python", "/app/auth_probe.py"]
+    volumes:
+      - ./auth_probe.py:/app/auth_probe.py:ro

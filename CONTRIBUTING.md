@@ -25,10 +25,13 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo build --release --locked --workspace
+sh tests/traefik/run.sh
 ```
 
-Those four commands are exactly what CI runs. If they pass locally, your pull
-request should come back green.
+Pull request CI runs the first four, which need only the Rust toolchain. The
+Traefik integration test starts real containers, so CI runs it on release only,
+where it gates the image build. Run it locally when you change the
+audience-binding path or the middleware contract it depends on.
 
 ### Optional: devbox
 
@@ -45,9 +48,15 @@ devbox run build
 
 ### About the tests
 
-The test suite is hermetic. HTTP calls to Cloudflare are stubbed with
+The Rust test suite is hermetic. HTTP calls to Cloudflare are stubbed with
 `mockito`, and the JWT tests generate a throwaway RSA keypair at run time, so
 you need **no Cloudflare account, no API token, and no network** to run it.
+
+`tests/traefik/run.sh` separately starts a real Traefik instance and a local
+auth probe to verify the trusted audience-header middleware chain. It uses no
+Cloudflare credentials, but its container images must already exist locally or
+be downloadable. This test covers Traefik's header behavior; the Rust tests
+separately cover the service's header parsing and authorization-mode behavior.
 
 To try it against real traffic you will need a Zero Trust team domain and a
 read-only API token — see the Configuration table in
@@ -60,6 +69,7 @@ read-only API token — see the Configuration table in
 | `src/main.rs` | The axum service: reads config from the environment and serves `GET /auth`. |
 | `cloudflare-authenticator/` | JWT verification — fetches the JWKS, checks signature and `aud`. |
 | `cloudflare-dynamic-config/` | Polls the Cloudflare API for the list of Access apps. |
+| `tests/traefik/` | Container integration test for trusted per-route audience binding. |
 
 The two subcrates are workspace members and hold most of the logic and most of
 the tests.
