@@ -29,7 +29,7 @@ On startup, the service loads both the signing keys and the complete self-hosted
 ```yaml
 services:
   forward-auth-rust:
-    image: nihaopaul/forward-auth-rust:0.5.0
+    image: nihaopaul/forward-auth-rust:0.6.0
     restart: unless-stopped
     environment:
       CF_DOMAIN: https://yourteam.cloudflareaccess.com
@@ -151,7 +151,7 @@ The service listens on `0.0.0.0` and exposes a single endpoint, `GET /auth`.
 
 **Runs on x86 and ARM.** Images are published for `linux/amd64` and `linux/arm64` under a single tag, so `docker pull` fetches the right one for your host — no `platform:` override needed on a Raspberry Pi, an Ampere VPS, or Apple silicon. (Releases before 0.4.1 were amd64 only.)
 
-**Pin a version.** The example uses `:0.5.0` rather than `:latest` so an unattended `docker compose pull` can't change what you're running.
+**Pin a version.** The example uses `:0.6.0` rather than `:latest` so an unattended `docker compose pull` can't change what you're running.
 
 ## Building from source
 
