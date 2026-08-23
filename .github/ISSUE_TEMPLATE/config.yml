@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/nihaopaul/Traefik-ForwardAuth-Cloudflare-Access-Rust/security/advisories/new
+    about: Report privately through GitHub. Please do not open a public issue.
+  - name: Setup and configuration
+    url: https://github.com/nihaopaul/Traefik-ForwardAuth-Cloudflare-Access-Rust#configuration
+    about: The README covers the environment variables and a working Traefik example.
