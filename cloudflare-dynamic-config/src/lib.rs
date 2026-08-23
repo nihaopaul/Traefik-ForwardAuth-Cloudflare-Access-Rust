@@ -9,10 +9,13 @@ const APPS_PER_PAGE: usize = 50;
 const MAX_APP_PAGES: usize = 1_000;
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CATALOG_REFRESH_TIMEOUT: Duration = Duration::from_secs(60);
+const SELF_HOSTED_APPLICATION_TYPE: &str = "self_hosted";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct App {
     pub aud: Option<String>,
+    #[serde(rename = "type")]
+    pub type_: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -36,9 +39,6 @@ pub struct DynamicConfigManager {
 
 #[derive(Debug, Serialize)]
 struct AppsQuery {
-    #[serde(rename = "match")]
-    match_: &'static str,
-    ui_apps: bool,
     page: usize,
     per_page: usize,
 }
@@ -102,9 +102,14 @@ impl DynamicConfigManager {
 
     fn update_catalog(&self, apps: Vec<App>, pages: usize) -> Result<(), ConfigError> {
         let app_count = apps.len();
+        let self_hosted_app_count = apps
+            .iter()
+            .filter(|app| app.type_.as_deref() == Some(SELF_HOSTED_APPLICATION_TYPE))
+            .count();
         let mut seen = HashSet::new();
         let auds = apps
             .into_iter()
+            .filter(|app| app.type_.as_deref() == Some(SELF_HOSTED_APPLICATION_TYPE))
             .filter_map(|app| app.aud)
             .filter(|aud| !aud.is_empty())
             .filter(|aud| seen.insert(aud.clone()))
@@ -115,7 +120,7 @@ impl DynamicConfigManager {
         }
 
         eprintln!(
-            "event=access_catalog_updated pages={pages} applications={app_count} audiences={}",
+            "event=access_catalog_updated pages={pages} applications={app_count} self_hosted_applications={self_hosted_app_count} audiences={}",
             auds.len()
         );
         self.catalog.lock().unwrap().auds = auds;
@@ -123,11 +128,7 @@ impl DynamicConfigManager {
     }
 
     async fn fetch_page(&self, page: usize) -> Result<AppsResponse, ConfigError> {
-        // Keep the historical filters until their effect on the accepted AUD
-        // set has been measured against a real account.
         let query = AppsQuery {
-            match_: "any",
-            ui_apps: true,
             page,
             per_page: APPS_PER_PAGE,
         };
@@ -221,12 +222,9 @@ mod tests {
     }
 
     fn page_query(page: usize) -> mockito::Matcher {
-        mockito::Matcher::AllOf(vec![
-            mockito::Matcher::UrlEncoded("match".into(), "any".into()),
-            mockito::Matcher::UrlEncoded("ui_apps".into(), "true".into()),
-            mockito::Matcher::UrlEncoded("page".into(), page.to_string()),
-            mockito::Matcher::UrlEncoded("per_page".into(), APPS_PER_PAGE.to_string()),
-        ])
+        mockito::Matcher::Regex(format!(
+            "^(page={page}&per_page={APPS_PER_PAGE}|per_page={APPS_PER_PAGE}&page={page})$"
+        ))
     }
 
     fn response(apps: serde_json::Value, total_pages: usize) -> String {
@@ -246,7 +244,10 @@ mod tests {
             .match_query(page_query(1))
             .with_header("content-type", "application/json")
             .with_body(response(
-                json!([{ "aud": "test-app-1" }, { "aud": "test-app-2" }]),
+                json!([
+                    { "aud": "test-app-1", "type": "self_hosted" },
+                    { "aud": "test-app-2", "type": "self_hosted" }
+                ]),
                 1,
             ))
             .expect(1)
@@ -262,13 +263,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn publishes_only_self_hosted_application_audiences() {
+        let mut server = mockito::Server::new_async().await;
+        let request = server
+            .mock("GET", "/client/v4/accounts/test-account/access/apps")
+            .match_query(page_query(1))
+            .with_body(response(
+                json!([
+                    { "aud": "self-hosted-aud", "type": "self_hosted" },
+                    { "aud": "launcher-aud", "type": "app_launcher" },
+                    { "aud": "saas-aud", "type": "saas" },
+                    { "aud": "missing-type-aud" }
+                ]),
+                1,
+            ))
+            .create_async()
+            .await;
+
+        let manager = DynamicConfigManager::new(config(&server))
+            .await
+            .expect("a self-hosted application produces a usable catalog");
+
+        assert_eq!(manager.get_aud().await, vec!["self-hosted-aud"]);
+        request.assert_async().await;
+    }
+
+    #[tokio::test]
     async fn fetches_every_page_and_deduplicates_audiences() {
         let mut server = mockito::Server::new_async().await;
         let first = server
             .mock("GET", "/client/v4/accounts/test-account/access/apps")
             .match_query(page_query(1))
             .with_body(response(
-                json!([{ "aud": "app-a" }, { "aud": null }, { "aud": "" }]),
+                json!([
+                    { "aud": "app-a", "type": "self_hosted" },
+                    { "aud": null, "type": "self_hosted" },
+                    { "aud": "", "type": "self_hosted" }
+                ]),
                 2,
             ))
             .create_async()
@@ -276,7 +307,13 @@ mod tests {
         let second = server
             .mock("GET", "/client/v4/accounts/test-account/access/apps")
             .match_query(page_query(2))
-            .with_body(response(json!([{ "aud": "app-b" }, { "aud": "app-a" }]), 2))
+            .with_body(response(
+                json!([
+                    { "aud": "app-b", "type": "self_hosted" },
+                    { "aud": "app-a", "type": "self_hosted" }
+                ]),
+                2,
+            ))
             .create_async()
             .await;
 
@@ -303,7 +340,10 @@ mod tests {
         let first = server
             .mock("GET", "/client/v4/accounts/test-account/access/apps")
             .match_query(page_query(1))
-            .with_body(response(json!([{ "aud": "partial" }]), 2))
+            .with_body(response(
+                json!([{ "aud": "partial", "type": "self_hosted" }]),
+                2,
+            ))
             .create_async()
             .await;
         let second = server
@@ -390,7 +430,10 @@ mod tests {
         let request = server
             .mock("GET", "/client/v4/accounts/test-account/access/apps")
             .match_query(page_query(1))
-            .with_body(response(json!([{ "aud": "app-a" }]), MAX_APP_PAGES + 1))
+            .with_body(response(
+                json!([{ "aud": "app-a", "type": "self_hosted" }]),
+                MAX_APP_PAGES + 1,
+            ))
             .expect(1)
             .create_async()
             .await;

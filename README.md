@@ -13,6 +13,8 @@ Cloudflare Access puts a login screen in front of your apps and sends a signed J
 3. It verifies the JWT signature and issuer against your team's public keys and domain, requires a Cloudflare Access application token (`type: app`), and checks the token was issued for one of *your* applications (its `aud`).
 4. Valid → `200` and Traefik serves the request. Anything else → `403`.
 
+Cloudflare Access identities may come from an interactive user (`email`) or a service token (`common_name`). Both are accepted after the same signature, issuer, application-token, expiry, and audience checks.
+
 It keeps itself current in the background, so you don't restart it when things change in Cloudflare:
 
 - **Public keys** refresh every 24 hours (Cloudflare rotates them).
@@ -20,7 +22,7 @@ It keeps itself current in the background, so you don't restart it when things c
 
 Nothing is stored on disk and no state is kept between requests.
 
-On startup, the service loads both the signing keys and the complete filtered application list before opening its listening port. If either initial fetch fails, startup fails instead of briefly serving an empty configuration. Later refresh failures keep the last complete version.
+On startup, the service loads both the signing keys and the complete self-hosted application list before opening its listening port. If either initial fetch fails, startup fails instead of briefly serving an empty configuration. Later refresh failures keep the last complete version.
 
 ## Quick start
 
