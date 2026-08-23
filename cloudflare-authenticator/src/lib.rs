@@ -50,17 +50,34 @@ pub struct Authenticator {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Claims {
-    aud: Vec<String>,
-    email: String,
+    aud: Audience,
+    email: Option<String>,
+    common_name: Option<String>,
     exp: usize,
     iat: usize,
-    nbf: usize,
+    nbf: Option<usize>,
     iss: String,
     #[serde(rename = "type")] // use is a reserved keyword in Rust, so we will rename it
     type_: String,
-    identity_nonce: String,
+    identity_nonce: Option<String>,
     sub: String,
-    country: String,
+    country: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Audience {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl Audience {
+    pub fn as_slice(&self) -> &[String] {
+        match self {
+            Self::One(audience) => std::slice::from_ref(audience),
+            Self::Many(audiences) => audiences,
+        }
+    }
 }
 
 #[derive(Error, Debug)]
@@ -75,6 +92,8 @@ pub enum ValidationError {
     InvalidToken,
     #[error("Token is not a Cloudflare Access application token")]
     InvalidTokenType,
+    #[error("Token has no user or service identity")]
+    MissingIdentity,
     #[error("No matching AUD found")]
     NoAudMatch,
     #[error("Certificate not found")]
@@ -107,7 +126,7 @@ impl ValidationError {
             | Self::InvalidSigningKey
             | Self::FetchCertificatesFailed => "signing_key_unavailable",
             Self::NoAudMatch => "audience_mismatch",
-            Self::InvalidToken => "malformed_token",
+            Self::InvalidToken | Self::MissingIdentity => "malformed_token",
             Self::InvalidTokenType => "invalid_token_type",
             Self::JwtDecodingError(error) => match error.kind() {
                 ErrorKind::ExpiredSignature => "expired_token",
@@ -175,6 +194,9 @@ impl Authenticator {
         self.observe_token_type(&token_data.claims.type_);
         if token_data.claims.type_ != ACCESS_APPLICATION_TOKEN_TYPE {
             return Err(ValidationError::InvalidTokenType);
+        }
+        if !token_data.claims.has_identity() {
+            return Err(ValidationError::MissingIdentity);
         }
 
         Ok(token_data)
@@ -252,6 +274,15 @@ impl Authenticator {
     }
 }
 
+impl Claims {
+    fn has_identity(&self) -> bool {
+        [&self.email, &self.common_name]
+            .into_iter()
+            .flatten()
+            .any(|identity| !identity.trim().is_empty())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,16 +354,17 @@ mod tests {
         // Issued an hour before it expires, so expired tokens stay coherent.
         let issued = exp.saturating_sub(3600);
         Claims {
-            aud: vec![aud.to_string()],
-            email: "user@example.com".to_string(),
+            aud: Audience::Many(vec![aud.to_string()]),
+            email: Some("user@example.com".to_string()),
+            common_name: None,
             exp,
             iat: issued,
-            nbf: issued,
+            nbf: Some(issued),
             iss: issuer.to_string(),
             type_: ACCESS_APPLICATION_TOKEN_TYPE.to_string(),
-            identity_nonce: "test-nonce".to_string(),
+            identity_nonce: Some("test-nonce".to_string()),
             sub: "00000000-0000-0000-0000-000000000000".to_string(),
-            country: "SG".to_string(),
+            country: Some("SG".to_string()),
         }
     }
 
@@ -358,7 +390,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accepts_a_validly_signed_token() {
+    async fn accepts_a_user_identity_with_an_array_audience() {
         let mut server = mockito::Server::new_async().await;
         let auth = authenticator(&mut server, jwk(KID, "RS256")).await;
 
@@ -372,8 +404,81 @@ mod tests {
             .await
             .expect("a correctly signed, unexpired, correctly-audienced token must verify");
 
-        assert_eq!(decoded.claims.email, "user@example.com");
-        assert_eq!(decoded.claims.aud, vec![AUD.to_string()]);
+        assert_eq!(decoded.claims.email.as_deref(), Some("user@example.com"));
+        assert_eq!(decoded.claims.aud.as_slice(), &[AUD.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn accepts_a_service_identity_with_a_scalar_audience_and_no_nbf() {
+        let mut server = mockito::Server::new_async().await;
+        let auth = authenticator(&mut server, jwk(KID, "RS256")).await;
+        let mut payload = serde_json::to_value(claims(AUD, now() + 3600, &server.url()))
+            .expect("serialize claims");
+        let payload = payload
+            .as_object_mut()
+            .expect("claims serialize as an object");
+        for claim in ["email", "nbf", "identity_nonce", "country"] {
+            payload.remove(claim);
+        }
+        payload.insert("aud".into(), json!(AUD));
+        payload.insert("common_name".into(), json!("automation-client"));
+        let token = sign_payload(&payload, Algorithm::RS256, Some(KID));
+
+        let decoded = auth
+            .decode(&token, vec![AUD.to_string()])
+            .await
+            .expect("a service-token identity should be accepted");
+
+        assert_eq!(decoded.claims.email, None);
+        assert_eq!(
+            decoded.claims.common_name.as_deref(),
+            Some("automation-client")
+        );
+        assert_eq!(decoded.claims.nbf, None);
+        assert_eq!(decoded.claims.aud.as_slice(), &[AUD.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn accepts_a_user_identity_with_a_scalar_audience() {
+        let mut server = mockito::Server::new_async().await;
+        let auth = authenticator(&mut server, jwk(KID, "RS256")).await;
+        let mut payload = serde_json::to_value(claims(AUD, now() + 3600, &server.url()))
+            .expect("serialize claims");
+        payload
+            .as_object_mut()
+            .expect("claims serialize as an object")
+            .insert("aud".into(), json!(AUD));
+        let token = sign_payload(&payload, Algorithm::RS256, Some(KID));
+
+        let decoded = auth
+            .decode(&token, vec![AUD.to_string()])
+            .await
+            .expect("a scalar audience with a user identity should be accepted");
+
+        assert_eq!(decoded.claims.email.as_deref(), Some("user@example.com"));
+        assert_eq!(decoded.claims.aud.as_slice(), &[AUD.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn rejects_an_application_token_without_a_user_or_service_identity() {
+        let mut server = mockito::Server::new_async().await;
+        let auth = authenticator(&mut server, jwk(KID, "RS256")).await;
+        let mut payload = serde_json::to_value(claims(AUD, now() + 3600, &server.url()))
+            .expect("serialize claims");
+        let payload = payload
+            .as_object_mut()
+            .expect("claims serialize as an object");
+        payload.remove("email");
+        payload.remove("common_name");
+        let token = sign_payload(&payload, Algorithm::RS256, Some(KID));
+
+        let error = auth
+            .decode(&token, vec![AUD.to_string()])
+            .await
+            .expect_err("a token without an identity must fail closed");
+
+        assert!(matches!(error, ValidationError::MissingIdentity));
+        assert_eq!(error.reason_code(), "malformed_token");
     }
 
     #[tokio::test]
@@ -598,7 +703,7 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let auth = authenticator(&mut server, jwk(KID, "RS256")).await;
         let mut token_claims = claims(AUD, now() + 3600, &server.url());
-        token_claims.nbf = now() + 120;
+        token_claims.nbf = Some(now() + 120);
         let token = sign(&token_claims, Algorithm::RS256, Some(KID));
 
         let error = auth
@@ -631,6 +736,30 @@ mod tests {
             "expected InvalidAudience, got {err:?}"
         );
         assert_eq!(err.reason_code(), "audience_mismatch");
+    }
+
+    #[tokio::test]
+    async fn rejects_a_scalar_audience_that_is_not_in_the_catalog() {
+        let mut server = mockito::Server::new_async().await;
+        let auth = authenticator(&mut server, jwk(KID, "RS256")).await;
+        let mut payload =
+            serde_json::to_value(claims("someone-elses-aud", now() + 3600, &server.url()))
+                .expect("serialize claims");
+        payload
+            .as_object_mut()
+            .expect("claims serialize as an object")
+            .insert("aud".into(), json!("someone-elses-aud"));
+        let token = sign_payload(&payload, Algorithm::RS256, Some(KID));
+
+        let error = auth
+            .decode(&token, vec![AUD.to_string()])
+            .await
+            .expect_err("a non-matching scalar audience must fail closed");
+
+        assert!(
+            matches!(&error, ValidationError::JwtDecodingError(error) if matches!(error.kind(), ErrorKind::InvalidAudience))
+        );
+        assert_eq!(error.reason_code(), "audience_mismatch");
     }
 
     #[tokio::test]
