@@ -2,9 +2,12 @@ use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, TokenData, Val
 use reqwest::{self, header};
 use serde::{Deserialize, Serialize};
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use tokio::time::{interval, Duration};
+
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Certs {
@@ -40,6 +43,7 @@ pub struct Config {
 pub struct Authenticator {
     config: Config,
     certs: Arc<Mutex<Certs>>,
+    observed_token_types: Arc<Mutex<HashSet<String>>>,
     client: reqwest::Client,
 }
 
@@ -72,6 +76,10 @@ pub enum ValidationError {
     NoAudMatch,
     #[error("Certificate not found")]
     CertificateNotFound,
+    #[error("JWKS contains no signing keys")]
+    NoSigningKeys,
+    #[error("JWKS contains invalid signing key material")]
+    InvalidSigningKey,
     #[error("Failed to fetch certificates")]
     FetchCertificatesFailed,
     #[error("JWT decoding error: {0}")]
@@ -86,8 +94,35 @@ pub enum ValidationError {
     SerdeUrlencodedError(#[from] serde_urlencoded::ser::Error),
 }
 
+impl ValidationError {
+    pub fn reason_code(&self) -> &'static str {
+        use jsonwebtoken::errors::ErrorKind;
+
+        match self {
+            Self::CertificateNotFound
+            | Self::NoSigningKeys
+            | Self::InvalidSigningKey
+            | Self::FetchCertificatesFailed => "signing_key_unavailable",
+            Self::NoAudMatch => "audience_mismatch",
+            Self::InvalidToken => "malformed_token",
+            Self::JwtDecodingError(error) => match error.kind() {
+                ErrorKind::ExpiredSignature => "expired_token",
+                ErrorKind::InvalidIssuer => "invalid_issuer",
+                ErrorKind::InvalidAudience => "audience_mismatch",
+                ErrorKind::InvalidSignature | ErrorKind::InvalidAlgorithm => "invalid_signature",
+                _ => "malformed_token",
+            },
+            _ => "malformed_token",
+        }
+    }
+}
+
 impl Authenticator {
     pub async fn new(config: Config) -> Result<Self, ValidationError> {
+        let config = Config {
+            api: config.api.trim_end_matches('/').to_string(),
+            duration: config.duration,
+        };
         let certs_manager = Self {
             config,
             certs: Arc::new(Mutex::new(Certs {
@@ -98,17 +133,21 @@ impl Authenticator {
                 },
                 public_certs: vec![],
             })),
-            client: reqwest::Client::new(),
+            observed_token_types: Arc::new(Mutex::new(HashSet::new())),
+            client: reqwest::Client::builder()
+                .timeout(HTTP_REQUEST_TIMEOUT)
+                .build()?,
         };
 
-        // Start the background task to update certs periodically
+        // Refuse to serve until signature validation can actually succeed.
+        certs_manager.fetch_certs().await?;
         certs_manager.clone().start_update_task();
 
         Ok(certs_manager)
     }
 
     fn update_certs(&self, new_certs: Certs) {
-        println!("Updating certs: {:?}", new_certs);
+        eprintln!("event=jwks_updated keys={}", new_certs.keys.len());
         let mut certs = self.certs.lock().unwrap();
         *certs = new_certs;
     }
@@ -123,17 +162,34 @@ impl Authenticator {
         let kid = header.kid.as_ref().ok_or(ValidationError::InvalidToken)?;
         let key = self.get_certificate(kid).await?;
 
-        let decode_key = DecodingKey::from_rsa_components(key.n.as_str(), key.e.as_str())?;
+        let decode_key = DecodingKey::from_rsa_components(key.n.as_str(), key.e.as_str())
+            .map_err(|_| ValidationError::InvalidSigningKey)?;
 
+        let validation = self.validation_for(key.alg, &auds);
+
+        let token_data = decode::<Claims>(&jwt, &decode_key, &validation)?;
+        self.observe_token_type(&token_data.claims.type_);
+
+        Ok(token_data)
+    }
+
+    fn validation_for(&self, algorithm: Algorithm, auds: &[String]) -> Validation {
         // Trust the algorithm advertised by the JWKS, not the one in the token
         // header: the header is attacker-controlled, so using it lets a caller
         // pick which algorithm their own token is checked against.
-        let mut validation = Validation::new(key.alg);
-        validation.set_audience(&auds);
+        let mut validation = Validation::new(algorithm);
+        validation.set_required_spec_claims(&["exp", "iss", "aud"]);
+        validation.set_audience(auds);
+        validation.set_issuer(&[self.config.api.as_str()]);
+        validation.validate_nbf = true;
+        validation
+    }
 
-        let token_data = decode::<Claims>(&jwt, &decode_key, &validation)?;
-
-        Ok(token_data)
+    fn observe_token_type(&self, token_type: &str) {
+        let mut observed = self.observed_token_types.lock().unwrap();
+        if observed.insert(token_type.to_string()) {
+            eprintln!("event=access_token_type_observed token_type={token_type:?}");
+        }
     }
 
     async fn get_certificate(&self, certificate_id: &str) -> Result<Key, ValidationError> {
@@ -157,10 +213,12 @@ impl Authenticator {
             .get(format!("{}/cdn-cgi/access/certs", self.config.api))
             .header(header::CONTENT_TYPE, "application/json")
             .send()
-            .await?;
+            .await?
+            .error_for_status()?;
 
         // Proceed with parsing the result
         match serde_json::from_value::<Certs>(response.json().await?) {
+            Ok(certs) if certs.keys.is_empty() => Err(ValidationError::NoSigningKeys),
             Ok(certs) => {
                 self.update_certs(certs);
                 Ok(())
@@ -175,10 +233,12 @@ impl Authenticator {
     fn start_update_task(self) {
         tokio::spawn(async move {
             let mut interval = interval(Duration::from_secs(self.config.duration));
+            // The initial fetch was synchronous, so skip interval's immediate tick.
+            interval.tick().await;
             loop {
                 interval.tick().await;
                 if let Err(e) = self.fetch_certs().await {
-                    eprintln!("Error updating certs: {}", e);
+                    eprintln!("event=jwks_refresh_failed error={e}");
                 }
             }
         });
@@ -232,14 +292,27 @@ mod tests {
         })
     }
 
-    fn sign(claims: &Claims, alg: Algorithm, kid: Option<&str>) -> String {
+    fn jwks_body(jwk: serde_json::Value) -> String {
+        json!({
+            "keys": [jwk],
+            "public_cert": { "kid": KID, "cert": "" },
+            "public_certs": [{ "kid": KID, "cert": "" }],
+        })
+        .to_string()
+    }
+
+    fn sign_payload<T: Serialize>(claims: &T, alg: Algorithm, kid: Option<&str>) -> String {
         let der = test_key().to_pkcs1_der().expect("encode test key");
         let mut header = Header::new(alg);
         header.kid = kid.map(str::to_string);
         encode(&header, claims, &EncodingKey::from_rsa_der(der.as_bytes())).expect("sign token")
     }
 
-    fn claims(aud: &str, exp: usize) -> Claims {
+    fn sign(claims: &Claims, alg: Algorithm, kid: Option<&str>) -> String {
+        sign_payload(claims, alg, kid)
+    }
+
+    fn claims(aud: &str, exp: usize, issuer: &str) -> Claims {
         // Issued an hour before it expires, so expired tokens stay coherent.
         let issued = exp.saturating_sub(3600);
         Claims {
@@ -248,7 +321,7 @@ mod tests {
             exp,
             iat: issued,
             nbf: issued,
-            iss: "https://example.cloudflareaccess.com".to_string(),
+            iss: issuer.to_string(),
             type_: "app".to_string(),
             identity_nonce: "test-nonce".to_string(),
             sub: "00000000-0000-0000-0000-000000000000".to_string(),
@@ -257,40 +330,24 @@ mod tests {
     }
 
     /// Serves `jwk` from a mock JWKS endpoint and returns an Authenticator whose
-    /// certs have actually been loaded.
+    /// certs have already been loaded synchronously.
     async fn authenticator(
         server: &mut mockito::ServerGuard,
         jwk: serde_json::Value,
     ) -> Authenticator {
-        let body = json!({
-            "keys": [jwk],
-            "public_cert": { "kid": KID, "cert": "" },
-            "public_certs": [{ "kid": KID, "cert": "" }],
-        });
-
         server
             .mock("GET", "/cdn-cgi/access/certs")
             .with_header("content-type", "application/json")
-            .with_body(body.to_string())
+            .with_body(jwks_body(jwk))
             .create_async()
             .await;
 
-        let auth = Authenticator::new(Config {
+        Authenticator::new(Config {
             api: server.url(),
             duration: 60 * 60 * 24,
         })
         .await
-        .expect("create authenticator");
-
-        // The initial fetch happens on the background task's first tick.
-        for _ in 0..100 {
-            let loaded = !auth.certs.lock().unwrap().keys.is_empty();
-            if loaded {
-                return auth;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        panic!("certs were never fetched from the mock JWKS endpoint");
+        .expect("create authenticator")
     }
 
     #[tokio::test]
@@ -298,7 +355,11 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let auth = authenticator(&mut server, jwk(KID, "RS256")).await;
 
-        let token = sign(&claims(AUD, now() + 3600), Algorithm::RS256, Some(KID));
+        let token = sign(
+            &claims(AUD, now() + 3600, &server.url()),
+            Algorithm::RS256,
+            Some(KID),
+        );
         let decoded = auth
             .decode(&token, vec![AUD.to_string()])
             .await
@@ -309,13 +370,184 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn accepts_one_matching_audience_from_the_catalog() {
+        let mut server = mockito::Server::new_async().await;
+        let auth = authenticator(&mut server, jwk(KID, "RS256")).await;
+        let token = sign(
+            &claims(AUD, now() + 3600, &server.url()),
+            Algorithm::RS256,
+            Some(KID),
+        );
+
+        auth.decode(&token, vec!["another-app".into(), AUD.into()])
+            .await
+            .expect("one matching catalog audience is sufficient");
+    }
+
+    #[tokio::test]
+    async fn initial_jwks_failure_prevents_startup() {
+        let mut server = mockito::Server::new_async().await;
+        let request = server
+            .mock("GET", "/cdn-cgi/access/certs")
+            .with_status(503)
+            .create_async()
+            .await;
+
+        Authenticator::new(Config {
+            api: server.url(),
+            duration: 60 * 60 * 24,
+        })
+        .await
+        .expect_err("startup must fail without signing keys");
+
+        request.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn an_empty_jwks_prevents_startup() {
+        let mut server = mockito::Server::new_async().await;
+        let request = server
+            .mock("GET", "/cdn-cgi/access/certs")
+            .with_body(
+                json!({
+                    "keys": [],
+                    "public_cert": { "kid": KID, "cert": "" },
+                    "public_certs": []
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        let error = Authenticator::new(Config {
+            api: server.url(),
+            duration: 60 * 60 * 24,
+        })
+        .await
+        .expect_err("startup must fail when the JWKS has no signing keys");
+
+        assert!(matches!(error, ValidationError::NoSigningKeys));
+        assert_eq!(error.reason_code(), "signing_key_unavailable");
+        request.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn normalizes_a_trailing_slash_and_validates_the_issuer() {
+        let mut server = mockito::Server::new_async().await;
+        let request = server
+            .mock("GET", "/cdn-cgi/access/certs")
+            .with_body(jwks_body(jwk(KID, "RS256")))
+            .create_async()
+            .await;
+        let auth = Authenticator::new(Config {
+            api: format!("{}/", server.url()),
+            duration: 60 * 60 * 24,
+        })
+        .await
+        .expect("create authenticator");
+        let token = sign(
+            &claims(AUD, now() + 3600, &server.url()),
+            Algorithm::RS256,
+            Some(KID),
+        );
+
+        auth.decode(&token, vec![AUD.to_string()])
+            .await
+            .expect("the normalized issuer must match");
+        request.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn rejects_and_classifies_a_wrong_issuer() {
+        let mut server = mockito::Server::new_async().await;
+        let auth = authenticator(&mut server, jwk(KID, "RS256")).await;
+        let token = sign(
+            &claims(AUD, now() + 3600, "https://other.cloudflareaccess.com"),
+            Algorithm::RS256,
+            Some(KID),
+        );
+
+        let error = auth
+            .decode(&token, vec![AUD.to_string()])
+            .await
+            .expect_err("a token from another issuer must fail");
+
+        assert_eq!(error.reason_code(), "invalid_issuer");
+        assert!(
+            matches!(&error, ValidationError::JwtDecodingError(error) if matches!(error.kind(), ErrorKind::InvalidIssuer))
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_tokens_missing_required_issuer_or_audience_claims() {
+        let mut server = mockito::Server::new_async().await;
+        let auth = authenticator(&mut server, jwk(KID, "RS256")).await;
+        let key = auth
+            .get_certificate(KID)
+            .await
+            .expect("test signing key is loaded");
+        let decoding_key =
+            DecodingKey::from_rsa_components(&key.n, &key.e).expect("test signing key is valid");
+        let audiences = vec![AUD.to_string()];
+        let validation = auth.validation_for(key.alg, &audiences);
+
+        for missing_claim in ["iss", "aud"] {
+            let mut payload = serde_json::to_value(claims(AUD, now() + 3600, &server.url()))
+                .expect("serialize claims");
+            payload
+                .as_object_mut()
+                .expect("claims serialize as an object")
+                .remove(missing_claim);
+            let token = sign_payload(&payload, Algorithm::RS256, Some(KID));
+
+            // Value accepts either missing claim, so this reaches Validation
+            // instead of failing early while deserializing the strict Claims
+            // type used by production decoding.
+            let error =
+                jsonwebtoken::decode::<serde_json::Value>(&token, &decoding_key, &validation)
+                    .expect_err(
+                        "required issuer and audience claims must be enforced by Validation",
+                    );
+
+            assert!(
+                matches!(error.kind(), ErrorKind::MissingRequiredClaim(_)),
+                "missing {missing_claim} should reach required-claim validation, got {error:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn observes_unexpected_token_types_without_enforcing_them_yet() {
+        let mut server = mockito::Server::new_async().await;
+        let auth = authenticator(&mut server, jwk(KID, "RS256")).await;
+        let mut token_claims = claims(AUD, now() + 3600, &server.url());
+        token_claims.type_ = "unexpected-signed-type".into();
+        let token = sign(&token_claims, Algorithm::RS256, Some(KID));
+
+        auth.decode(&token, vec![AUD.to_string()])
+            .await
+            .expect("Piece 1a observes token types without enforcing them");
+        auth.decode(&token, vec![AUD.to_string()])
+            .await
+            .expect("the same observed type remains valid");
+
+        let observed = auth.observed_token_types.lock().unwrap();
+        assert_eq!(observed.len(), 1);
+        assert!(observed.contains("unexpected-signed-type"));
+    }
+
+    #[tokio::test]
     async fn rejects_an_expired_token() {
         let mut server = mockito::Server::new_async().await;
         let auth = authenticator(&mut server, jwk(KID, "RS256")).await;
 
         // Comfortably past jsonwebtoken's default 60s clock-skew leeway, which
         // would otherwise still accept a token that expired seconds ago.
-        let token = sign(&claims(AUD, now() - 3600), Algorithm::RS256, Some(KID));
+        let token = sign(
+            &claims(AUD, now() - 3600, &server.url()),
+            Algorithm::RS256,
+            Some(KID),
+        );
         let err = auth
             .decode(&token, vec![AUD.to_string()])
             .await
@@ -328,12 +560,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn applies_jsonwebtokens_sixty_second_expiration_leeway() {
+        let mut server = mockito::Server::new_async().await;
+        let auth = authenticator(&mut server, jwk(KID, "RS256")).await;
+        let issuer = server.url();
+        let within_leeway = sign(
+            &claims(AUD, now() - 59, &issuer),
+            Algorithm::RS256,
+            Some(KID),
+        );
+        let beyond_leeway = sign(
+            &claims(AUD, now() - 61, &issuer),
+            Algorithm::RS256,
+            Some(KID),
+        );
+
+        auth.decode(&within_leeway, vec![AUD.to_string()])
+            .await
+            .expect("a token 59 seconds past exp is inside the configured leeway");
+        let error = auth
+            .decode(&beyond_leeway, vec![AUD.to_string()])
+            .await
+            .expect_err("a token 61 seconds past exp is outside the configured leeway");
+
+        assert_eq!(error.reason_code(), "expired_token");
+    }
+
+    #[tokio::test]
+    async fn rejects_a_token_that_is_not_valid_yet() {
+        let mut server = mockito::Server::new_async().await;
+        let auth = authenticator(&mut server, jwk(KID, "RS256")).await;
+        let mut token_claims = claims(AUD, now() + 3600, &server.url());
+        token_claims.nbf = now() + 120;
+        let token = sign(&token_claims, Algorithm::RS256, Some(KID));
+
+        let error = auth
+            .decode(&token, vec![AUD.to_string()])
+            .await
+            .expect_err("a token beyond the 60-second nbf leeway must be rejected");
+
+        assert!(
+            matches!(&error, ValidationError::JwtDecodingError(error) if matches!(error.kind(), ErrorKind::ImmatureSignature))
+        );
+    }
+
+    #[tokio::test]
     async fn rejects_a_token_for_a_different_audience() {
         let mut server = mockito::Server::new_async().await;
         let auth = authenticator(&mut server, jwk(KID, "RS256")).await;
 
         let token = sign(
-            &claims("someone-elses-aud", now() + 3600),
+            &claims("someone-elses-aud", now() + 3600, &server.url()),
             Algorithm::RS256,
             Some(KID),
         );
@@ -346,6 +623,7 @@ mod tests {
             matches!(&err, ValidationError::JwtDecodingError(e) if matches!(e.kind(), ErrorKind::InvalidAudience)),
             "expected InvalidAudience, got {err:?}"
         );
+        assert_eq!(err.reason_code(), "audience_mismatch");
     }
 
     #[tokio::test]
@@ -354,7 +632,11 @@ mod tests {
         // The JWKS only knows "rotated-key"; the token claims "test-key-1".
         let auth = authenticator(&mut server, jwk("rotated-key", "RS256")).await;
 
-        let token = sign(&claims(AUD, now() + 3600), Algorithm::RS256, Some(KID));
+        let token = sign(
+            &claims(AUD, now() + 3600, &server.url()),
+            Algorithm::RS256,
+            Some(KID),
+        );
         let err = auth
             .decode(&token, vec![AUD.to_string()])
             .await
@@ -364,6 +646,28 @@ mod tests {
             matches!(err, ValidationError::CertificateNotFound),
             "expected CertificateNotFound, got {err:?}"
         );
+        assert_eq!(err.reason_code(), "signing_key_unavailable");
+    }
+
+    #[tokio::test]
+    async fn invalid_jwks_key_material_is_a_server_side_failure() {
+        let mut server = mockito::Server::new_async().await;
+        let mut invalid_jwk = jwk(KID, "RS256");
+        invalid_jwk["n"] = json!("not-valid-base64!");
+        let auth = authenticator(&mut server, invalid_jwk).await;
+        let token = sign(
+            &claims(AUD, now() + 3600, &server.url()),
+            Algorithm::RS256,
+            Some(KID),
+        );
+
+        let error = auth
+            .decode(&token, vec![AUD.to_string()])
+            .await
+            .expect_err("invalid JWKS key material must fail validation");
+
+        assert!(matches!(error, ValidationError::InvalidSigningKey));
+        assert_eq!(error.reason_code(), "signing_key_unavailable");
     }
 
     #[tokio::test]
@@ -371,7 +675,11 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let auth = authenticator(&mut server, jwk(KID, "RS256")).await;
 
-        let token = sign(&claims(AUD, now() + 3600), Algorithm::RS256, None);
+        let token = sign(
+            &claims(AUD, now() + 3600, &server.url()),
+            Algorithm::RS256,
+            None,
+        );
         let err = auth
             .decode(&token, vec![AUD.to_string()])
             .await
@@ -381,6 +689,7 @@ mod tests {
             matches!(err, ValidationError::InvalidToken),
             "expected InvalidToken, got {err:?}"
         );
+        assert_eq!(err.reason_code(), "malformed_token");
     }
 
     /// Regression test: the algorithm must come from the JWKS, not the token
@@ -392,7 +701,11 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let auth = authenticator(&mut server, jwk(KID, "RS256")).await;
 
-        let token = sign(&claims(AUD, now() + 3600), Algorithm::RS384, Some(KID));
+        let token = sign(
+            &claims(AUD, now() + 3600, &server.url()),
+            Algorithm::RS384,
+            Some(KID),
+        );
         let err = auth
             .decode(&token, vec![AUD.to_string()])
             .await
@@ -402,5 +715,6 @@ mod tests {
             matches!(&err, ValidationError::JwtDecodingError(e) if matches!(e.kind(), ErrorKind::InvalidAlgorithm)),
             "expected InvalidAlgorithm, got {err:?}"
         );
+        assert_eq!(err.reason_code(), "invalid_signature");
     }
 }

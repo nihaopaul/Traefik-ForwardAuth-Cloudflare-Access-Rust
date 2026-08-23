@@ -2,15 +2,15 @@
 
 A small service that lets **Traefik** enforce **Cloudflare Zero Trust** access rules on any route it serves.
 
-Cloudflare Access puts a login screen in front of your apps and hands the browser a signed `CF_Authorization` cookie. Traefik can't check that cookie by itself. This service does: Traefik asks it about every request, and it answers `200` (allow) or `403` (deny). Works with Traefik 2.x and 3.x.
+Cloudflare Access puts a login screen in front of your apps and sends a signed JWT in the `Cf-Access-Jwt-Assertion` header and `CF_Authorization` cookie. Traefik can't check that JWT by itself. This service does: Traefik asks it about every request, and it answers `200` (allow) or `403` (deny). Works with Traefik 2.x and 3.x.
 
 > Originally attempted as a native Traefik plugin, but Traefik's WASM support follows the R1 spec and is too limited. This is a Rust port of [Traefik-ForwardAuth-Cloudflare-Access](https://github.com/nihaopaul/Traefik-ForwardAuth-Cloudflare-Access).
 
 ## How it works
 
-1. A user hits your app. Traefik pauses the request and asks this service `GET /auth`, forwarding the cookies.
-2. The service reads the `CF_Authorization` cookie. No cookie → `403`, and Cloudflare shows the login page.
-3. It verifies the cookie's JWT signature against your team's public keys, and checks the token was issued for one of *your* applications (its `aud`).
+1. A user hits your app. Traefik pauses the request and asks this service `GET /auth`, forwarding the request credentials.
+2. The service prefers the `Cf-Access-Jwt-Assertion` header and falls back to the `CF_Authorization` cookie. No token → `403`, and Cloudflare shows the login page.
+3. It verifies the JWT signature and issuer against your team's public keys and domain, and checks the token was issued for one of *your* applications (its `aud`).
 4. Valid → `200` and Traefik serves the request. Anything else → `403`.
 
 It keeps itself current in the background, so you don't restart it when things change in Cloudflare:
@@ -19,6 +19,8 @@ It keeps itself current in the background, so you don't restart it when things c
 - **Application list** refreshes every hour (so new apps start working on their own).
 
 Nothing is stored on disk and no state is kept between requests.
+
+On startup, the service loads both the signing keys and the complete filtered application list before opening its listening port. If either initial fetch fails, startup fails instead of briefly serving an empty configuration. Later refresh failures keep the last complete version.
 
 ## Quick start
 
@@ -79,6 +81,10 @@ The service listens on `0.0.0.0` and exposes a single endpoint, `GET /auth`.
 ## Notes
 
 **Protect the right things.** This gates on "is this a valid login for one of my Cloudflare apps" — it does not evaluate per-application policies. Two apps behind the same instance can accept each other's tokens, so think carefully before putting it in front of a writable dashboard or API.
+
+**Expiry allows normal clock skew.** JWT expiration uses jsonwebtoken's 60-second leeway, so `expired_token` is logged only after a token is more than 60 seconds past its `exp` value.
+
+**Denials are diagnosable without leaking credentials.** The service logs stable reason codes for rejected requests. Detailed denial events are limited per reason, with suppressed-event summaries, and tokens, cookies, signing keys, identities, and full claims are never logged.
 
 **Runs on x86 and ARM.** Images are published for `linux/amd64` and `linux/arm64` under a single tag, so `docker pull` fetches the right one for your host — no `platform:` override needed on a Raspberry Pi, an Ampere VPS, or Apple silicon. (Releases before 0.4.1 were amd64 only.)
 

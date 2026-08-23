@@ -26,3 +26,6 @@ path = "cloudflare-dynamic-config"
 
 [dependencies.cloudflare-authenticator]
 path = "cloudflare-authenticator"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
