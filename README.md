@@ -25,7 +25,7 @@ Nothing is stored on disk and no state is kept between requests.
 ```yaml
 services:
   forward-auth-rust:
-    image: nihaopaul/forward-auth-rust:0.4.0
+    image: nihaopaul/forward-auth-rust:0.4.1
     restart: unless-stopped
     environment:
       CF_DOMAIN: https://yourteam.cloudflareaccess.com
@@ -80,9 +80,9 @@ The service listens on `0.0.0.0` and exposes a single endpoint, `GET /auth`.
 
 **Protect the right things.** This gates on "is this a valid login for one of my Cloudflare apps" — it does not evaluate per-application policies. Two apps behind the same instance can accept each other's tokens, so think carefully before putting it in front of a writable dashboard or API.
 
-**Only `linux/amd64` images are published.** On arm64 hosts you'll need emulation, or build the image yourself.
+**Runs on x86 and ARM.** Images are published for `linux/amd64` and `linux/arm64` under a single tag, so `docker pull` fetches the right one for your host — no `platform:` override needed on a Raspberry Pi, an Ampere VPS, or Apple silicon. (Releases before 0.4.1 were amd64 only.)
 
-**Pin a version.** The example uses `:0.4.0` rather than `:latest` so an unattended `docker compose pull` can't change what you're running.
+**Pin a version.** The example uses `:0.4.1` rather than `:latest` so an unattended `docker compose pull` can't change what you're running.
 
 ## Building from source
 
