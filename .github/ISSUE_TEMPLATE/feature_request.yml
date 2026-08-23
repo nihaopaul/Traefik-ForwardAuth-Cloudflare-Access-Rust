@@ -1,0 +1,46 @@
+name: Feature request
+description: Suggest a change or an addition
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This is a deliberately small, single-purpose service. Please skim the
+        [Scope section of CONTRIBUTING.md](https://github.com/nihaopaul/Traefik-ForwardAuth-Cloudflare-Access-Rust/blob/main/CONTRIBUTING.md#scope)
+        first — it says what is likely to be accepted and what is not.
+
+  - type: checkboxes
+    attributes:
+      label: Checks
+      options:
+        - label: I searched the existing issues.
+          required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do that you cannot do today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like to happen
+      description: If it adds a dependency or an environment variable, say so here.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+      description: Including anything you tried in Traefik or Cloudflare Access itself.
+
+  - type: checkboxes
+    id: willing
+    attributes:
+      label: Would you be up for implementing it?
+      options:
+        - label: I would be willing to open a pull request for this.

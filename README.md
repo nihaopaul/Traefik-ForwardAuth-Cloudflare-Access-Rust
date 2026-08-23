@@ -86,11 +86,19 @@ The service listens on `0.0.0.0` and exposes a single endpoint, `GET /auth`.
 
 ## Building from source
 
-Requires [devbox](https://www.jetify.com/devbox) (which supplies the Rust toolchain):
+Any recent stable Rust toolchain will do:
 
 ```bash
-devbox run test     # run the test suite
-devbox run build    # release build
+cargo test --workspace                        # run the test suite
+cargo build --release --locked --workspace    # release build
+```
+
+Or, if you would rather not install Rust, [devbox](https://www.jetify.com/devbox)
+supplies the toolchain and wraps the same commands:
+
+```bash
+devbox run test
+devbox run build
 ```
 
 The container image is a statically linked musl binary on `distroless/static`, about 12 MB uncompressed, with no shell and no libc in the runtime layer.

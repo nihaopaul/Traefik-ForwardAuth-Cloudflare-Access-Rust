@@ -1,0 +1,100 @@
+name: Bug report
+description: Something does not work the way it should
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file this.
+
+        **Before you paste anything:** redact your `CF_TOKEN`, your
+        `CF_Authorization` cookie, and any JWTs. A decoded token *header* is
+        fine and often useful; the signed token itself is a live credential.
+
+  - type: checkboxes
+    attributes:
+      label: Checks
+      options:
+        - label: I searched the existing issues.
+          required: true
+        - label: This is not a security vulnerability (those go through the private advisory form).
+          required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Image tag or commit you are running.
+      placeholder: "0.4.1"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: How are you running it?
+      options:
+        - Docker Compose
+        - docker run
+        - Kubernetes
+        - Built from source
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: arch
+    attributes:
+      label: Architecture
+      options:
+        - amd64
+        - arm64
+        - Not sure
+    validations:
+      required: false
+
+  - type: input
+    id: traefik
+    attributes:
+      label: Traefik version
+      placeholder: "3.2"
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: Include the status code you got back, if the problem is an allow/deny decision.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected instead
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Start the service with ...
+        2. Hit the protected route with ...
+        3. Get 403 instead of 200
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Service logs
+      description: Output from the forward-auth container around the failure. Automatically formatted as code.
+      render: text
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Traefik middleware config
+      description: The forwardAuth middleware and the router it is attached to. Automatically formatted as code.
+      render: yaml
