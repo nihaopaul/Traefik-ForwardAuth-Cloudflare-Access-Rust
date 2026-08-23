@@ -8,6 +8,7 @@ use thiserror::Error;
 use tokio::time::{interval, Duration};
 
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const ACCESS_APPLICATION_TOKEN_TYPE: &str = "app";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Certs {
@@ -72,6 +73,8 @@ pub enum ValidationError {
     SerdeJsonError(#[from] serde_json::Error),
     #[error("Invalid token")]
     InvalidToken,
+    #[error("Token is not a Cloudflare Access application token")]
+    InvalidTokenType,
     #[error("No matching AUD found")]
     NoAudMatch,
     #[error("Certificate not found")]
@@ -105,6 +108,7 @@ impl ValidationError {
             | Self::FetchCertificatesFailed => "signing_key_unavailable",
             Self::NoAudMatch => "audience_mismatch",
             Self::InvalidToken => "malformed_token",
+            Self::InvalidTokenType => "invalid_token_type",
             Self::JwtDecodingError(error) => match error.kind() {
                 ErrorKind::ExpiredSignature => "expired_token",
                 ErrorKind::InvalidIssuer => "invalid_issuer",
@@ -169,6 +173,9 @@ impl Authenticator {
 
         let token_data = decode::<Claims>(&jwt, &decode_key, &validation)?;
         self.observe_token_type(&token_data.claims.type_);
+        if token_data.claims.type_ != ACCESS_APPLICATION_TOKEN_TYPE {
+            return Err(ValidationError::InvalidTokenType);
+        }
 
         Ok(token_data)
     }
@@ -322,7 +329,7 @@ mod tests {
             iat: issued,
             nbf: issued,
             iss: issuer.to_string(),
-            type_: "app".to_string(),
+            type_: ACCESS_APPLICATION_TOKEN_TYPE.to_string(),
             identity_nonce: "test-nonce".to_string(),
             sub: "00000000-0000-0000-0000-000000000000".to_string(),
             country: "SG".to_string(),
@@ -517,20 +524,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn observes_unexpected_token_types_without_enforcing_them_yet() {
+    async fn rejects_and_observes_non_application_token_types() {
         let mut server = mockito::Server::new_async().await;
         let auth = authenticator(&mut server, jwk(KID, "RS256")).await;
         let mut token_claims = claims(AUD, now() + 3600, &server.url());
         token_claims.type_ = "unexpected-signed-type".into();
         let token = sign(&token_claims, Algorithm::RS256, Some(KID));
 
-        auth.decode(&token, vec![AUD.to_string()])
+        let error = auth
+            .decode(&token, vec![AUD.to_string()])
             .await
-            .expect("Piece 1a observes token types without enforcing them");
-        auth.decode(&token, vec![AUD.to_string()])
-            .await
-            .expect("the same observed type remains valid");
+            .expect_err("Piece 1b requires a Cloudflare Access application token");
 
+        assert!(matches!(error, ValidationError::InvalidTokenType));
+        assert_eq!(error.reason_code(), "invalid_token_type");
         let observed = auth.observed_token_types.lock().unwrap();
         assert_eq!(observed.len(), 1);
         assert!(observed.contains("unexpected-signed-type"));

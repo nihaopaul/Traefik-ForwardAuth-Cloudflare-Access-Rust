@@ -10,7 +10,7 @@ Cloudflare Access puts a login screen in front of your apps and sends a signed J
 
 1. A user hits your app. Traefik pauses the request and asks this service `GET /auth`, forwarding the request credentials.
 2. The service prefers the `Cf-Access-Jwt-Assertion` header and falls back to the `CF_Authorization` cookie. No token → `403`, and Cloudflare shows the login page.
-3. It verifies the JWT signature and issuer against your team's public keys and domain, and checks the token was issued for one of *your* applications (its `aud`).
+3. It verifies the JWT signature and issuer against your team's public keys and domain, requires a Cloudflare Access application token (`type: app`), and checks the token was issued for one of *your* applications (its `aud`).
 4. Valid → `200` and Traefik serves the request. Anything else → `403`.
 
 It keeps itself current in the background, so you don't restart it when things change in Cloudflare:
