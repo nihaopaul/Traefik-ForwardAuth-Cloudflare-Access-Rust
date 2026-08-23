@@ -1,48 +1,96 @@
-This document serves as a guide for a Proof of Concept (POC) aimed at validating Cloudflare Zero Trust forwards using Traefik's forward-auth service. The rust service is compatible with both Traefik 2.x and Traefik 3.x versions, originally i setout ot build a traefik only plugin but the limitations of the current WASM implementation follows R1 spec and as such is limited.
+# Traefik Forward Auth for Cloudflare Access
 
-This is a port of: https://github.com/nihaopaul/Traefik-ForwardAuth-Cloudflare-Access
+A small service that lets **Traefik** enforce **Cloudflare Zero Trust** access rules on any route it serves.
 
-The primary goal is to demonstrate how to authenticate Traefik requests through Cloudflare Zero Trust, ensuring secure access control.
+Cloudflare Access puts a login screen in front of your apps and hands the browser a signed `CF_Authorization` cookie. Traefik can't check that cookie by itself. This service does: Traefik asks it about every request, and it answers `200` (allow) or `403` (deny). Works with Traefik 2.x and 3.x.
 
-Additionally most configurations have moved to environmental variables which allow you to dockerise it, and since AUDs will come and go along with certificates the certficates refresh every 24hours while the auds refresh every hour using cloudflare APIS.
+> Originally attempted as a native Traefik plugin, but Traefik's WASM support follows the R1 spec and is too limited. This is a Rust port of [Traefik-ForwardAuth-Cloudflare-Access](https://github.com/nihaopaul/Traefik-ForwardAuth-Cloudflare-Access).
 
-#### setup a read only API token with permission: Account > Access: apps and policies > Read
+## How it works
 
+1. A user hits your app. Traefik pauses the request and asks this service `GET /auth`, forwarding the cookies.
+2. The service reads the `CF_Authorization` cookie. No cookie → `403`, and Cloudflare shows the login page.
+3. It verifies the cookie's JWT signature against your team's public keys, and checks the token was issued for one of *your* applications (its `aud`).
+4. Valid → `200` and Traefik serves the request. Anything else → `403`.
+
+It keeps itself current in the background, so you don't restart it when things change in Cloudflare:
+
+- **Public keys** refresh every 24 hours (Cloudflare rotates them).
+- **Application list** refreshes every hour (so new apps start working on their own).
+
+Nothing is stored on disk and no state is kept between requests.
+
+## Quick start
+
+```yaml
+services:
+  forward-auth-rust:
+    image: nihaopaul/forward-auth-rust:0.4.0
+    restart: unless-stopped
+    environment:
+      CF_DOMAIN: https://yourteam.cloudflareaccess.com
+      CF_ORG: your-cloudflare-account-id
+      CF_TOKEN: your-read-only-api-token
+      PORT: '9001'
+    ports:
+      - '9001:9001'
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 50M
 ```
-CF_TOKEN=_this is your cf token_
-```
 
-#### take from the cloudflare dashboard url https://dash.cloudflare.com/{your ORG ID}
+Then tell Traefik to use it as a middleware:
 
-```
-CF_ORG=_this is your ID for cloudflare_
-```
-
-#### what you have configured in cloudflare zero trust: team domain
-
-```
-CF_DOMAIN=https://{yourdomain}.cloudflareaccess.com
-traefik config such as auth.yml
-```
-
-```yml
+```yaml
 http:
   middlewares:
-    test-auth:
+    cf-auth:
       forwardAuth:
-        address: "http://IP:PORT/auth"
+        address: "http://forward-auth-rust:9001/auth"
 ```
 
-then under the domain specify the provider, you probably dont want to do this on a writable dashboard or API.
+And apply it to a route:
 
-```yml
+```yaml
 http:
   routers:
     dashboard:
-      rule: Host(`{your domain}`)
+      rule: Host(`traefik.example.com`)
       service: api@internal
-      middlewares:
-        - test-auth
       entryPoints:
-        - "websecure"
+        - websecure
+      middlewares:
+        - cf-auth
 ```
+
+## Configuration
+
+| Variable | Required | Description |
+| --- | --- | --- |
+| `CF_DOMAIN` | yes | Your Zero Trust team domain, including `https://` — the hostname where Cloudflare shows your login page. |
+| `CF_ORG` | yes | Your Cloudflare **account ID** — the value in your dashboard URL, `https://dash.cloudflare.com/{account-id}`. |
+| `CF_TOKEN` | yes | API token with **Account → Access: Apps and Policies → Read**. Read-only is enough. |
+| `PORT` | no | Port to listen on. Defaults to `3000`. |
+
+The service listens on `0.0.0.0` and exposes a single endpoint, `GET /auth`.
+
+## Notes
+
+**Protect the right things.** This gates on "is this a valid login for one of my Cloudflare apps" — it does not evaluate per-application policies. Two apps behind the same instance can accept each other's tokens, so think carefully before putting it in front of a writable dashboard or API.
+
+**Only `linux/amd64` images are published.** On arm64 hosts you'll need emulation, or build the image yourself.
+
+**Pin a version.** The example uses `:0.4.0` rather than `:latest` so an unattended `docker compose pull` can't change what you're running.
+
+## Building from source
+
+Requires [devbox](https://www.jetify.com/devbox) (which supplies the Rust toolchain):
+
+```bash
+devbox run test     # run the test suite
+devbox run build    # release build
+```
+
+The container image is a statically linked musl binary on `distroless/static`, about 12 MB uncompressed, with no shell and no libc in the runtime layer.
