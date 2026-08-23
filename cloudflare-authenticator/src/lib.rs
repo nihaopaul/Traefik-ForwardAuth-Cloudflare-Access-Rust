@@ -258,7 +258,10 @@ mod tests {
 
     /// Serves `jwk` from a mock JWKS endpoint and returns an Authenticator whose
     /// certs have actually been loaded.
-    async fn authenticator(server: &mut mockito::ServerGuard, jwk: serde_json::Value) -> Authenticator {
+    async fn authenticator(
+        server: &mut mockito::ServerGuard,
+        jwk: serde_json::Value,
+    ) -> Authenticator {
         let body = json!({
             "keys": [jwk],
             "public_cert": { "kid": KID, "cert": "" },

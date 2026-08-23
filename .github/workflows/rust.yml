@@ -12,13 +12,22 @@ env:
 
 jobs:
   build:
-    name: build and test
+    name: lint, build and test
     permissions:
       contents: read
     runs-on: ubuntu-latest
     steps:
       - name: check repository
         uses: actions/checkout@v7
+
+      # Cheap checks first, so a formatting slip fails in seconds instead of
+      # after a full release build. rustfmt and clippy ship with the runner's
+      # stable toolchain.
+      - name: format
+        run: cargo fmt --all --check
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: build
         run: cargo build --release --locked --workspace
