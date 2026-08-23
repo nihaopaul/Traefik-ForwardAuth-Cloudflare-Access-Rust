@@ -8,6 +8,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  REGISTRY_IMAGE: nihaopaul/forward-auth-rust
 
 jobs:
   build:
@@ -25,16 +26,38 @@ jobs:
       - name: test
         run: cargo test --workspace
 
+  # One job per architecture, each on a runner of that architecture, so the
+  # Rust tree is never cross-compiled under emulation. These push by digest
+  # only; tags are applied by the merge job below.
   docker:
-    name: push docker image to hub
+    name: build image (${{ matrix.arch }})
     if: github.event_name == 'release'
     needs: build
     permissions:
       contents: read
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
     steps:
       - name: check repository
         uses: actions/checkout@v7
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY_IMAGE }}
+
+      - name: set up buildx
+        uses: docker/setup-buildx-action@v4
 
       - name: login to docker registry
         uses: docker/login-action@v4
@@ -42,17 +65,91 @@ jobs:
           username: ${{secrets.DOCKERHUB_USERNAME}}
           password: ${{secrets.DOCKERHUB_TOKEN}}
 
-      - name: Docker meta
-        id: meta
-        uses: docker/metadata-action@v6
-        with:
-          images: nihaopaul/forward-auth-rust
-
-      - name: build and push docker image to registry
+      - name: build and push by digest
+        id: build
         uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          annotations: ${{ steps.meta.outputs.annotations }}
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.REGISTRY_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: upload digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: digests-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Collects the per-architecture digests into one multi-arch tag, so that
+  # `docker pull nihaopaul/forward-auth-rust:<tag>` resolves per host.
+  docker-merge:
+    name: push multi-arch manifest
+    if: github.event_name == 'release'
+    needs: docker
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - name: download digests
+        uses: actions/download-artifact@v8
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: set up buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY_IMAGE }}
+        env:
+          # Annotations default to the `manifest:` level, which is wrong for a
+          # manifest list. Emit them pre-prefixed for the index instead.
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: index
+
+      - name: login to docker registry
+        uses: docker/login-action@v4
+        with:
+          username: ${{secrets.DOCKERHUB_USERNAME}}
+          password: ${{secrets.DOCKERHUB_TOKEN}}
+
+      - name: create manifest list and push
+        shell: bash
+        working-directory: /tmp/digests
+        run: |
+          set -euo pipefail
+          args=()
+          while IFS= read -r a; do
+            [ -n "$a" ] && args+=("--annotation" "$a")
+          done <<< "${DOCKER_METADATA_OUTPUT_ANNOTATIONS:-}"
+          while IFS= read -r t; do
+            [ -n "$t" ] && args+=("-t" "$t")
+          done < <(jq -r '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          for d in *; do
+            args+=("${REGISTRY_IMAGE}@sha256:${d}")
+          done
+          docker buildx imagetools create "${args[@]}"
+
+      - name: verify both architectures are published
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag='${{ steps.meta.outputs.version }}'
+          docker buildx imagetools inspect "${REGISTRY_IMAGE}:${tag}"
+          for arch in amd64 arm64; do
+            docker buildx imagetools inspect --raw "${REGISTRY_IMAGE}:${tag}" \
+              | jq -e --arg a "$arch" '[.manifests[].platform.architecture] | index($a)' >/dev/null \
+              || { echo "::error::$arch is missing from the published manifest"; exit 1; }
+          done
