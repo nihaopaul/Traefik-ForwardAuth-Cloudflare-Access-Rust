@@ -26,5 +26,5 @@ mockito = "1.6.1"
 # no committed private key and no hardcoded expiry. Already in the dependency
 # tree via jsonwebtoken's rust_crypto backend.
 base64 = "0.22"
-rand = "0.8"
+rand = "0.10"
 rsa = { version = "0.9", features = ["pem"] }
