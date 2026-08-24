@@ -9,3 +9,11 @@ updates:
     directory: "/" # Location of package manifests
     schedule:
       interval: "weekly"
+    ignore:
+      # rand 0.9+ sits on rand_core 0.9, but rsa 0.9 — the latest stable — takes
+      # its RNG as rand_core 0.6's `CryptoRngCore`. The two trait hierarchies are
+      # unrelated, so the test keygen in cloudflare-authenticator cannot compile
+      # against a newer rand. Drop this entry and bump rsa and rand together once
+      # rsa 0.10 ships stable.
+      - dependency-name: "rand"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
