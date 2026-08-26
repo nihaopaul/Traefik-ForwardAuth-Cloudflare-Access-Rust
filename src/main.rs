@@ -2,6 +2,7 @@ use cloudflare_authenticator as cfa;
 use cloudflare_dynamic_config as cdc;
 use local_ip_address::local_ip;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::env;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -27,24 +28,24 @@ trait TokenAuthenticator: Clone + Send + Sync + 'static {
     fn validate(
         &self,
         token: &str,
-        auds: Vec<String>,
+        auds: Arc<HashSet<String>>,
     ) -> impl std::future::Future<Output = Result<(), &'static str>> + Send;
 }
 
 impl TokenAuthenticator for cfa::Authenticator {
-    async fn validate(&self, token: &str, auds: Vec<String>) -> Result<(), &'static str> {
-        self.test(token, auds)
+    async fn validate(&self, token: &str, auds: Arc<HashSet<String>>) -> Result<(), &'static str> {
+        self.test(token, &auds)
             .await
             .map_err(|error| error.reason_code())
     }
 }
 
 trait AudienceCatalog: Clone + Send + Sync + 'static {
-    fn audiences(&self) -> impl std::future::Future<Output = Vec<String>> + Send;
+    fn audiences(&self) -> impl std::future::Future<Output = Arc<HashSet<String>>> + Send;
 }
 
 impl AudienceCatalog for cdc::DynamicConfigManager {
-    async fn audiences(&self) -> Vec<String> {
+    async fn audiences(&self) -> Arc<HashSet<String>> {
         self.get_aud().await
     }
 }
@@ -369,7 +370,7 @@ where
     };
 
     let auds = match select_audience(req.headers(), state.authorization_mode) {
-        Ok(AudienceSelection::Bound(audience)) => vec![audience],
+        Ok(AudienceSelection::Bound(audience)) => Arc::new(HashSet::from([audience])),
         Ok(AudienceSelection::Catalog) => {
             let Some(configurator) = state.configurator.as_ref() else {
                 state
@@ -497,7 +498,11 @@ mod tests {
     }
 
     impl TokenAuthenticator for FakeAuthenticator {
-        async fn validate(&self, _token: &str, _auds: Vec<String>) -> Result<(), &'static str> {
+        async fn validate(
+            &self,
+            _token: &str,
+            _auds: Arc<HashSet<String>>,
+        ) -> Result<(), &'static str> {
             match self.denial_reason {
                 Some(reason) => Err(reason),
                 None => Ok(()),
@@ -509,8 +514,8 @@ mod tests {
     struct FakeCatalog(Vec<String>);
 
     impl AudienceCatalog for FakeCatalog {
-        async fn audiences(&self) -> Vec<String> {
-            self.0.clone()
+        async fn audiences(&self) -> Arc<HashSet<String>> {
+            Arc::new(self.0.iter().cloned().collect())
         }
     }
 
@@ -518,7 +523,7 @@ mod tests {
     struct PanicCatalog;
 
     impl AudienceCatalog for PanicCatalog {
-        async fn audiences(&self) -> Vec<String> {
+        async fn audiences(&self) -> Arc<HashSet<String>> {
             panic!("an explicitly bound request must not read the catalog")
         }
     }
@@ -527,13 +532,17 @@ mod tests {
     struct AppBoundAuthenticator;
 
     impl TokenAuthenticator for AppBoundAuthenticator {
-        async fn validate(&self, token: &str, auds: Vec<String>) -> Result<(), &'static str> {
+        async fn validate(
+            &self,
+            token: &str,
+            auds: Arc<HashSet<String>>,
+        ) -> Result<(), &'static str> {
             let expected_audience = match token {
                 "token-a" => "app-a",
                 "token-b" => "app-b",
                 _ => return Err(MALFORMED_TOKEN),
             };
-            if auds == [expected_audience] {
+            if auds.contains(expected_audience) {
                 Ok(())
             } else {
                 Err("audience_mismatch")

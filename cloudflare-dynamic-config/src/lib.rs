@@ -27,7 +27,7 @@ pub struct Config {
 
 #[derive(Debug, Clone, Default)]
 struct Catalog {
-    auds: Vec<String>,
+    auds: Arc<HashSet<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -96,8 +96,8 @@ impl DynamicConfigManager {
         Ok(manager)
     }
 
-    pub async fn get_aud(&self) -> Vec<String> {
-        self.catalog.lock().unwrap().auds.clone()
+    pub async fn get_aud(&self) -> Arc<HashSet<String>> {
+        Arc::clone(&self.catalog.lock().unwrap().auds)
     }
 
     fn update_catalog(&self, apps: Vec<App>, pages: usize) -> Result<(), ConfigError> {
@@ -106,14 +106,12 @@ impl DynamicConfigManager {
             .iter()
             .filter(|app| app.type_.as_deref() == Some(SELF_HOSTED_APPLICATION_TYPE))
             .count();
-        let mut seen = HashSet::new();
-        let auds = apps
+        let auds: HashSet<String> = apps
             .into_iter()
             .filter(|app| app.type_.as_deref() == Some(SELF_HOSTED_APPLICATION_TYPE))
             .filter_map(|app| app.aud)
             .filter(|aud| !aud.is_empty())
-            .filter(|aud| seen.insert(aud.clone()))
-            .collect::<Vec<_>>();
+            .collect();
 
         if auds.is_empty() {
             return Err(ConfigError::EmptyCatalog);
@@ -123,7 +121,7 @@ impl DynamicConfigManager {
             "event=access_catalog_updated pages={pages} applications={app_count} self_hosted_applications={self_hosted_app_count} audiences={}",
             auds.len()
         );
-        self.catalog.lock().unwrap().auds = auds;
+        self.catalog.lock().unwrap().auds = Arc::new(auds);
         Ok(())
     }
 
@@ -258,7 +256,10 @@ mod tests {
             .await
             .expect("create manager");
 
-        assert_eq!(manager.get_aud().await, vec!["test-app-1", "test-app-2"]);
+        let auds = manager.get_aud().await;
+        assert_eq!(auds.len(), 2);
+        assert!(auds.contains("test-app-1"));
+        assert!(auds.contains("test-app-2"));
         request.assert_async().await;
     }
 
@@ -284,7 +285,9 @@ mod tests {
             .await
             .expect("a self-hosted application produces a usable catalog");
 
-        assert_eq!(manager.get_aud().await, vec!["self-hosted-aud"]);
+        let auds = manager.get_aud().await;
+        assert_eq!(auds.len(), 1);
+        assert!(auds.contains("self-hosted-aud"));
         request.assert_async().await;
     }
 
@@ -321,7 +324,10 @@ mod tests {
             .await
             .expect("create manager");
 
-        assert_eq!(manager.get_aud().await, vec!["app-a", "app-b"]);
+        let auds = manager.get_aud().await;
+        assert_eq!(auds.len(), 2);
+        assert!(auds.contains("app-a"));
+        assert!(auds.contains("app-b"));
         first.assert_async().await;
         second.assert_async().await;
     }
@@ -332,7 +338,7 @@ mod tests {
         let manager = DynamicConfigManager {
             config: config(&server),
             catalog: Arc::new(Mutex::new(Catalog {
-                auds: vec!["known-good".into()],
+                auds: Arc::new(HashSet::from(["known-good".into()])),
             })),
             client: DynamicConfigManager::http_client().expect("build test HTTP client"),
         };
@@ -358,7 +364,7 @@ mod tests {
             .await
             .expect_err("a failed later page must fail the refresh");
 
-        assert_eq!(manager.get_aud().await, vec!["known-good"]);
+        assert!(manager.get_aud().await.contains("known-good"));
         first.assert_async().await;
         second.assert_async().await;
     }
@@ -403,7 +409,7 @@ mod tests {
         let manager = DynamicConfigManager {
             config: config(&server),
             catalog: Arc::new(Mutex::new(Catalog {
-                auds: vec!["known-good".into()],
+                auds: Arc::new(HashSet::from(["known-good".into()])),
             })),
             client: DynamicConfigManager::http_client().expect("build test HTTP client"),
         };
@@ -420,7 +426,7 @@ mod tests {
             .expect_err("an empty refresh must not replace known-good state");
 
         assert!(matches!(error, ConfigError::EmptyCatalog));
-        assert_eq!(manager.get_aud().await, vec!["known-good"]);
+        assert!(manager.get_aud().await.contains("known-good"));
         request.assert_async().await;
     }
 

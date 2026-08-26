@@ -178,7 +178,7 @@ impl Authenticator {
     pub async fn decode(
         &self,
         jwt: &str,
-        auds: Vec<String>,
+        auds: &HashSet<String>,
     ) -> Result<TokenData<Claims>, ValidationError> {
         let header = decode_header(jwt)?;
 
@@ -188,8 +188,10 @@ impl Authenticator {
         let decode_key = DecodingKey::from_rsa_components(key.n.as_str(), key.e.as_str())
             .map_err(|_| ValidationError::InvalidSigningKey)?;
 
-        let validation = self.validation_for(key.alg, &auds);
+        let validation = self.validation_for(key.alg);
 
+        // Signature, expiry, issuer, nbf, and type are checked first so that
+        // unauthenticated requests fail before touching the audience catalog.
         let token_data = decode::<Claims>(&jwt, &decode_key, &validation)?;
         self.observe_token_type(&token_data.claims.type_);
         if token_data.claims.type_ != ACCESS_APPLICATION_TOKEN_TYPE {
@@ -199,18 +201,39 @@ impl Authenticator {
             return Err(ValidationError::MissingIdentity);
         }
 
+        // Audience is checked after signature verification. The catalog is an
+        // Arc<HashSet> shared across requests, so this is an O(1) lookup with
+        // no per-request allocation regardless of catalog size.
+        if !token_data
+            .claims
+            .aud
+            .as_slice()
+            .iter()
+            .any(|a| auds.contains(a))
+        {
+            return Err(ValidationError::NoAudMatch);
+        }
+
         Ok(token_data)
     }
 
-    fn validation_for(&self, algorithm: Algorithm, auds: &[String]) -> Validation {
+    fn validation_for(&self, algorithm: Algorithm) -> Validation {
         // Trust the algorithm advertised by the JWKS, not the one in the token
         // header: the header is attacker-controlled, so using it lets a caller
         // pick which algorithm their own token is checked against.
+        // Audience is not passed to set_audience here — doing so would
+        // deep-copy the entire catalog into a HashSet before the signature
+        // check, letting unauthenticated requests drive unbounded allocation.
         let mut validation = Validation::new(algorithm);
         validation.set_required_spec_claims(&["exp", "iss", "aud"]);
-        validation.set_audience(auds);
         validation.set_issuer(&[self.config.api.as_str()]);
         validation.validate_nbf = true;
+        // Audience value is checked manually after signature verification.
+        // validate_aud must be false here or jsonwebtoken v11 returns
+        // InvalidAudience whenever aud is present but no audience is configured
+        // on the Validation struct — which is always the case in this two-phase
+        // approach. required_spec_claims still enforces aud presence.
+        validation.validate_aud = false;
         validation
     }
 
@@ -231,7 +254,7 @@ impl Authenticator {
         }
     }
 
-    pub async fn test(&self, jwt: &str, auds: Vec<String>) -> Result<(), ValidationError> {
+    pub async fn test(&self, jwt: &str, auds: &HashSet<String>) -> Result<(), ValidationError> {
         self.decode(jwt, auds).await?;
         Ok(())
     }
@@ -400,7 +423,7 @@ mod tests {
             Some(KID),
         );
         let decoded = auth
-            .decode(&token, vec![AUD.to_string()])
+            .decode(&token, &HashSet::from([AUD.to_string()]))
             .await
             .expect("a correctly signed, unexpired, correctly-audienced token must verify");
 
@@ -425,7 +448,7 @@ mod tests {
         let token = sign_payload(&payload, Algorithm::RS256, Some(KID));
 
         let decoded = auth
-            .decode(&token, vec![AUD.to_string()])
+            .decode(&token, &HashSet::from([AUD.to_string()]))
             .await
             .expect("a service-token identity should be accepted");
 
@@ -451,7 +474,7 @@ mod tests {
         let token = sign_payload(&payload, Algorithm::RS256, Some(KID));
 
         let decoded = auth
-            .decode(&token, vec![AUD.to_string()])
+            .decode(&token, &HashSet::from([AUD.to_string()]))
             .await
             .expect("a scalar audience with a user identity should be accepted");
 
@@ -473,7 +496,7 @@ mod tests {
         let token = sign_payload(&payload, Algorithm::RS256, Some(KID));
 
         let error = auth
-            .decode(&token, vec![AUD.to_string()])
+            .decode(&token, &HashSet::from([AUD.to_string()]))
             .await
             .expect_err("a token without an identity must fail closed");
 
@@ -491,7 +514,7 @@ mod tests {
             Some(KID),
         );
 
-        auth.decode(&token, vec!["another-app".into(), AUD.into()])
+        auth.decode(&token, &HashSet::from(["another-app".into(), AUD.into()]))
             .await
             .expect("one matching catalog audience is sufficient");
     }
@@ -563,7 +586,7 @@ mod tests {
             Some(KID),
         );
 
-        auth.decode(&token, vec![AUD.to_string()])
+        auth.decode(&token, &HashSet::from([AUD.to_string()]))
             .await
             .expect("the normalized issuer must match");
         request.assert_async().await;
@@ -580,7 +603,7 @@ mod tests {
         );
 
         let error = auth
-            .decode(&token, vec![AUD.to_string()])
+            .decode(&token, &HashSet::from([AUD.to_string()]))
             .await
             .expect_err("a token from another issuer must fail");
 
@@ -600,8 +623,7 @@ mod tests {
             .expect("test signing key is loaded");
         let decoding_key =
             DecodingKey::from_rsa_components(&key.n, &key.e).expect("test signing key is valid");
-        let audiences = vec![AUD.to_string()];
-        let validation = auth.validation_for(key.alg, &audiences);
+        let validation = auth.validation_for(key.alg);
 
         for missing_claim in ["iss", "aud"] {
             let mut payload = serde_json::to_value(claims(AUD, now() + 3600, &server.url()))
@@ -637,7 +659,7 @@ mod tests {
         let token = sign(&token_claims, Algorithm::RS256, Some(KID));
 
         let error = auth
-            .decode(&token, vec![AUD.to_string()])
+            .decode(&token, &HashSet::from([AUD.to_string()]))
             .await
             .expect_err("Piece 1b requires a Cloudflare Access application token");
 
@@ -661,7 +683,7 @@ mod tests {
             Some(KID),
         );
         let err = auth
-            .decode(&token, vec![AUD.to_string()])
+            .decode(&token, &HashSet::from([AUD.to_string()]))
             .await
             .expect_err("an expired token must be rejected");
 
@@ -687,11 +709,11 @@ mod tests {
             Some(KID),
         );
 
-        auth.decode(&within_leeway, vec![AUD.to_string()])
+        auth.decode(&within_leeway, &HashSet::from([AUD.to_string()]))
             .await
             .expect("a token 59 seconds past exp is inside the configured leeway");
         let error = auth
-            .decode(&beyond_leeway, vec![AUD.to_string()])
+            .decode(&beyond_leeway, &HashSet::from([AUD.to_string()]))
             .await
             .expect_err("a token 61 seconds past exp is outside the configured leeway");
 
@@ -707,7 +729,7 @@ mod tests {
         let token = sign(&token_claims, Algorithm::RS256, Some(KID));
 
         let error = auth
-            .decode(&token, vec![AUD.to_string()])
+            .decode(&token, &HashSet::from([AUD.to_string()]))
             .await
             .expect_err("a token beyond the 60-second nbf leeway must be rejected");
 
@@ -727,13 +749,13 @@ mod tests {
             Some(KID),
         );
         let err = auth
-            .decode(&token, vec![AUD.to_string()])
+            .decode(&token, &HashSet::from([AUD.to_string()]))
             .await
             .expect_err("a token issued for another audience must be rejected");
 
         assert!(
-            matches!(&err, ValidationError::JwtDecodingError(e) if matches!(e.kind(), ErrorKind::InvalidAudience)),
-            "expected InvalidAudience, got {err:?}"
+            matches!(&err, ValidationError::NoAudMatch),
+            "expected NoAudMatch, got {err:?}"
         );
         assert_eq!(err.reason_code(), "audience_mismatch");
     }
@@ -752,12 +774,13 @@ mod tests {
         let token = sign_payload(&payload, Algorithm::RS256, Some(KID));
 
         let error = auth
-            .decode(&token, vec![AUD.to_string()])
+            .decode(&token, &HashSet::from([AUD.to_string()]))
             .await
             .expect_err("a non-matching scalar audience must fail closed");
 
         assert!(
-            matches!(&error, ValidationError::JwtDecodingError(error) if matches!(error.kind(), ErrorKind::InvalidAudience))
+            matches!(&error, ValidationError::NoAudMatch),
+            "expected NoAudMatch, got {error:?}"
         );
         assert_eq!(error.reason_code(), "audience_mismatch");
     }
@@ -774,7 +797,7 @@ mod tests {
             Some(KID),
         );
         let err = auth
-            .decode(&token, vec![AUD.to_string()])
+            .decode(&token, &HashSet::from([AUD.to_string()]))
             .await
             .expect_err("a token whose kid is absent from the JWKS must be rejected");
 
@@ -798,7 +821,7 @@ mod tests {
         );
 
         let error = auth
-            .decode(&token, vec![AUD.to_string()])
+            .decode(&token, &HashSet::from([AUD.to_string()]))
             .await
             .expect_err("invalid JWKS key material must fail validation");
 
@@ -817,7 +840,7 @@ mod tests {
             None,
         );
         let err = auth
-            .decode(&token, vec![AUD.to_string()])
+            .decode(&token, &HashSet::from([AUD.to_string()]))
             .await
             .expect_err("a token without a kid must be rejected");
 
@@ -843,7 +866,7 @@ mod tests {
             Some(KID),
         );
         let err = auth
-            .decode(&token, vec![AUD.to_string()])
+            .decode(&token, &HashSet::from([AUD.to_string()]))
             .await
             .expect_err("RS384 must be refused when the JWKS advertises RS256");
 
