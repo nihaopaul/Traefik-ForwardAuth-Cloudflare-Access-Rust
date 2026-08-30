@@ -72,6 +72,11 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY_IMAGE }}
+          labels: |
+            org.opencontainers.image.title=Traefik Forward Auth for Cloudflare Access
+            org.opencontainers.image.description=Traefik ForwardAuth middleware that validates Cloudflare Access JWTs
+            org.opencontainers.image.licenses=MIT
+            org.opencontainers.image.vendor=Paul Adams
 
       - name: set up buildx
         uses: docker/setup-buildx-action@v4
@@ -131,6 +136,11 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY_IMAGE }}
+          labels: |
+            org.opencontainers.image.title=Traefik Forward Auth for Cloudflare Access
+            org.opencontainers.image.description=Traefik ForwardAuth middleware that validates Cloudflare Access JWTs
+            org.opencontainers.image.licenses=MIT
+            org.opencontainers.image.vendor=Paul Adams
         env:
           # Annotations default to the `manifest:` level, which is wrong for a
           # manifest list. Emit them pre-prefixed for the index instead.
