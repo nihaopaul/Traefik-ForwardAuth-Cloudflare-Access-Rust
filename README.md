@@ -26,7 +26,7 @@ On startup, the service loads the signing keys before opening its listening port
 ```yaml
 services:
   forward-auth-rust:
-    image: nihaopaul/forward-auth-rust:0.6.0
+    image: nihaopaul/forward-auth-rust:0.6.1
     restart: unless-stopped
     environment:
       CF_AUTHORIZATION_MODE: per_app
@@ -115,7 +115,7 @@ Legacy deployments omit `CF_AUTHORIZATION_MODE` or set it to `any_app`, and requ
 ```yaml
 services:
   forward-auth-rust:
-    image: nihaopaul/forward-auth-rust:0.6.0
+    image: nihaopaul/forward-auth-rust:0.6.1
     environment:
       CF_AUTHORIZATION_MODE: any_app
       CF_DOMAIN: https://yourteam.cloudflareaccess.com
@@ -148,7 +148,7 @@ To migrate without a flag day, add the trusted `X-Auth-Audience` middleware to r
 
 **Runs on x86 and ARM.** Images are published for `linux/amd64` and `linux/arm64` under a single tag, so `docker pull` fetches the right one for your host — no `platform:` override needed on a Raspberry Pi, an Ampere VPS, or Apple silicon. (Releases before 0.4.1 were amd64 only.)
 
-**Pin a version.** The example uses `:0.6.0` rather than `:latest` so an unattended `docker compose pull` can't change what you're running.
+**Pin a version.** The example uses `:0.6.1` rather than `:latest` so an unattended `docker compose pull` can't change what you're running.
 
 ## Building from source
 
